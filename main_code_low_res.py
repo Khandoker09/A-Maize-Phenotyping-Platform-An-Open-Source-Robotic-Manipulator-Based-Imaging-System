@@ -2,7 +2,12 @@
 """
 AprilTag-based dual-camera capture + alignment (deterministic)
 Adds tqdm progress bars and timing to track runtime, and saves outputs.
+
+Minimal changes:
+- Decouple cloud detail from ICP by using ICP on downsampled copies only.
+- Keep final clouds high-detail; apply ICP transform to the full-res clouds.
 """
+
 # Dependencies:
 #   pip install opencv-python pyrealsense2 open3d numpy tqdm
 #   pip install apriltag                 # primary AprilTag binding
@@ -63,20 +68,23 @@ o3d.geometry.PointCloud.voxel_down_sample = deterministic_voxel_down_sample
 SERIAL0            = '311322303919'
 SERIAL1            = '252222300195'
 TAG_ID             = 3      # AprilTag ID
-TAG_SIZE           = 0.074    # meters
+TAG_SIZE           = 0.074  # meters
 NUM_FRAMES         = 6
 WARMUP             = 1.0
 GRAB_ATTEMPTS      = 10
 GRAB_TIMEOUT       = 2000
-VOXEL_SIZE         = 1e-8
+VOXEL_SIZE         = 1e-8   # keep your original (used for final write-downsample)
 DEPTH_TRUNC        = 2.0
 VISUALIZE          = True
 # Manual tweaks
 FINAL_TRANSLATION  = [0.0, 0.0, 0.0]
 FINAL_ROTATION_DEG = [0.0, 0.0, 0.0]
-# Manual tweaks
-#FINAL_TRANSLATION  = [0.175, 0.175, 0.0]
-#FINAL_ROTATION_DEG = [0.0, -4.0, 0.0]
+
+# --- NEW: decouple detail (cloud) from alignment (ICP) ---
+CLOUD_VOXEL     = 0.0005   # 0.5 mm detail for preprocessing/final clouds
+ICP_VOXEL       = 0.003    # 3 mm downsample for ICP copies only
+ICP_DIST_LOCAL  = 0.010    # 1 cm correspondence threshold near tag
+ICP_DIST_GLOBAL = 0.020    # 2 cm correspondence threshold global
 
 # === CAMERA & CAPTURE ===
 def start_cam(serial):
@@ -127,10 +135,11 @@ def capture_seq(serial):
 
 # === CLOUD BUILD ===
 def preprocess_cloud(pc):
-    pc = pc.voxel_down_sample(VOXEL_SIZE)
+    # Use high-detail voxel for final clouds (decoupled from ICP)
+    pc = pc.voxel_down_sample(CLOUD_VOXEL)
     _, ind = pc.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.5)
     pc = pc.select_by_index(sorted(ind))
-    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=VOXEL_SIZE*3, max_nn=50))
+    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=CLOUD_VOXEL*3, max_nn=50))
     pc.orient_normals_consistent_tangent_plane(10)
     return pc
 
@@ -145,7 +154,7 @@ def build_cloud(rgbds, intr, label=""):
 # === APRILTAG POSE ===
 def detect_tag_pose(color_img, intr, tid, tsize):
     img = np.asarray(color_img)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)  # keep as in your base
     dets = _tag_detector.detect(gray)
     if VISUALIZE:
         vis = img.copy()
@@ -155,7 +164,10 @@ def detect_tag_pose(color_img, intr, tid, tsize):
             cv2.polylines(vis, [pts], True, (0,255,0), 2)
             iid = d.tag_id if hasattr(d, 'tag_id') else d.id
             cv2.putText(vis, f"ID={iid}", tuple(pts[0][0]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-        cv2.imshow('AprilTag', vis); cv2.waitKey(500); cv2.destroyAllWindows()
+        try:
+            cv2.imshow('AprilTag', vis); cv2.waitKey(500); cv2.destroyAllWindows()
+        except cv2.error:
+            pass
     if not dets: raise RuntimeError('Tag not detected')
     chosen = next((d for d in dets if (d.tag_id if hasattr(d, 'tag_id') else d.id)==tid), dets[0])
     half = tsize / 2.0
@@ -192,8 +204,7 @@ def main():
     o3d.io.write_point_cloud(os.path.join(out_dir, f"cam0_raw_{timestamp}.ply"), pc0_raw)
     o3d.io.write_point_cloud(os.path.join(out_dir, f"cam1_raw_{timestamp}.ply"), pc1_raw)
 
-        # Detect tags and align to tag frame
-    # note rawX lists contain tuples (color_np, depth_np), so pick element 0 for color image
+    # Detect tags and align to tag frame
     T0 = detect_tag_pose(raw0[0][0], i0, TAG_ID, TAG_SIZE)
     T1 = detect_tag_pose(raw1[0][0], i1, TAG_ID, TAG_SIZE)
     pc0_raw.transform(np.linalg.inv(T0))
@@ -203,24 +214,35 @@ def main():
     o3d.io.write_point_cloud(os.path.join(out_dir, f"cam0_aligned_{timestamp}.ply"), pc0_raw)
     o3d.io.write_point_cloud(os.path.join(out_dir, f"cam1_aligned_{timestamp}.ply"), pc1_raw)
 
-    # Full ICP + manual tweaks
+    # === ICP on downsampled copies (keeps detail in main clouds) ===
     T_full = np.eye(4)
-    # Local planar ICP
+
+    # Make lightweight copies just for registration
+    pc0_icp = pc0_raw.voxel_down_sample(ICP_VOXEL)
+    pc1_icp = pc1_raw.voxel_down_sample(ICP_VOXEL)
+
+    # Local planar ICP around the tag
     half = TAG_SIZE/2.0
     bbox = o3d.geometry.AxisAlignedBoundingBox([-half,-half,-0.01], [half,half,0.01])
-    sub0, sub1 = pc0_raw.crop(bbox), pc1_raw.crop(bbox)
+    sub0, sub1 = pc0_icp.crop(bbox), pc1_icp.crop(bbox)
     if len(sub0.points)>50 and len(sub1.points)>50:
         res_loc = o3d.pipelines.registration.registration_icp(
-            sub1, sub0, VOXEL_SIZE*0.5, np.eye(4),
+            sub1, sub0, ICP_DIST_LOCAL, np.eye(4),
             o3d.pipelines.registration.TransformationEstimationPointToPlane(),
             o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30))
-        pc1_raw.transform(res_loc.transformation); T_full = res_loc.transformation @ T_full
+        T_full = res_loc.transformation @ T_full
+        pc1_icp.transform(res_loc.transformation)
+
     # Global ICP
     res_glob = o3d.pipelines.registration.registration_icp(
-        pc1_raw, pc0_raw, VOXEL_SIZE*1.5, np.eye(4),
+        pc1_icp, pc0_icp, ICP_DIST_GLOBAL, np.eye(4),
         o3d.pipelines.registration.TransformationEstimationPointToPlane(),
         o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50))
-    pc1_raw.transform(res_glob.transformation); T_full = res_glob.transformation @ T_full
+    T_full = res_glob.transformation @ T_full
+
+    # Apply the final ICP transform to the HIGH-DETAIL cloud
+    pc1_raw.transform(T_full)
+
     # Manual tweaks
     if any(FINAL_TRANSLATION):
         Tt = np.eye(4); Tt[:3,3] = FINAL_TRANSLATION
@@ -233,13 +255,13 @@ def main():
         Rm = Rz @ Ry @ Rx; Tr = np.eye(4); Tr[:3,:3] = Rm
         pc1_raw.transform(Tr); T_full = Tr @ T_full
 
-    # Final merge
+    # Final merge (keep your VOXEL_SIZE for optional write-downsample)
     merged = pc0_raw + pc1_raw
     merged = merged.voxel_down_sample(VOXEL_SIZE)
     merged_fn = os.path.join(out_dir, f"merged_{timestamp}.ply")
     o3d.io.write_point_cloud(merged_fn, merged)
 
-    # Save alignment matrix
+    # Save alignment matrix (cam1→cam0)
     T_cam1_to_cam0 = np.linalg.inv(T0) @ T_full @ T1
     np.save(os.path.join(out_dir, f"align_matrix_{timestamp}.npy"), T_cam1_to_cam0)
 
