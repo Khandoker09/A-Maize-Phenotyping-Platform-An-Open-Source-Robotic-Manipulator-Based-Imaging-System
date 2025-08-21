@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+AprilTag-based dual-camera capture + alignment (deterministic)
+- Uses correct RGB->GRAY for AprilTag
+- Runs ICP on downsampled copies with realistic thresholds (fixes Z-slice)
+- Keeps final merged cloud high detail
+"""
+
+import os
+import random
+import time
+import numpy as np
+import open3d as o3d
+import pyrealsense2 as rs
+import cv2
+from datetime import datetime
+from tqdm import tqdm
+
+# AprilTag import with fallback
+try:
+    import apriltag
+    opts = apriltag.DetectorOptions(
+        families='tag36h11', border=1,
+        quad_decimate=1.0, quad_sigma=0.0,
+        refine_edges=True)
+    _tag_detector = apriltag.Detector(opts)
+except ImportError:
+    try:
+        from pupil_apriltags import Detector as PDetector
+        _tag_detector = PDetector(families='tag36h11')
+    except ImportError:
+        raise ImportError(
+            "AprilTag detector not found. Install 'apriltag' or 'pupil-apriltags'.")
+
+# === FULL DETERMINISM SETUP ===
+os.environ.update({
+    'OMP_NUM_THREADS':'1','OPENBLAS_NUM_THREADS':'1',
+    'MKL_NUM_THREADS':'1','VECLIB_MAXIMUM_THREADS':'1',
+    'NUMEXPR_NUM_THREADS':'1','PYTHONHASHSEED':'42'})
+random.seed(42)
+np.random.seed(42)
+o3d.utility.random.seed(42)
+np.random.shuffle = lambda x,*a,**k:None
+
+# Deterministic voxel downsample ordering
+auth_voxel = o3d.geometry.PointCloud.voxel_down_sample
+def deterministic_voxel_down_sample(self, vsz):
+    pc = auth_voxel(self, vsz)
+    pts = np.asarray(pc.points)
+    if pts.size == 0:
+        return pc
+    idx = np.lexsort((pts[:,2], pts[:,1], pts[:,0]))
+    pc.points = o3d.utility.Vector3dVector(pts[idx])
+    if pc.has_colors():
+        pc.colors = o3d.utility.Vector3dVector(np.asarray(pc.colors)[idx])
+    if pc.has_normals():
+        pc.normals = o3d.utility.Vector3dVector(np.asarray(pc.normals)[idx])
+    return pc
+o3d.geometry.PointCloud.voxel_down_sample = deterministic_voxel_down_sample
+
+# === USER CONFIGURATION ===
+SERIAL0            = '311322303919'
+SERIAL1            = '252222300195'
+TAG_ID             = 3              # AprilTag ID
+TAG_SIZE           = 0.03026        # meters (30.26 mm outer black square)
+NUM_FRAMES         = 6
+WARMUP             = 1.0
+GRAB_ATTEMPTS      = 10
+GRAB_TIMEOUT       = 2000
+VOXEL_SIZE_WRITE   = 1e-8           # ONLY for final optional write-downsample
+DEPTH_TRUNC        = 2.5
+VISUALIZE          = True
+
+# Manual tweaks
+FINAL_TRANSLATION  = [0.0, 0.0, 0.0]
+FINAL_ROTATION_DEG = [0.0, 0.0, 0.0]
+
+# Cloud/ICP parameters
+CLOUD_VOXEL   = 0.0005   # 0.5 mm detail for the clouds you keep
+ICP_VOXEL     = 0.0030   # 3 mm downsample for ICP copies
+ICP_DIST_LOCAL  = 0.006  # 6 mm near tag
+ICP_DIST_GLOBAL = 0.020  # 20 mm global
+
+# === CAMERA & CAPTURE ===
+def start_cam(serial):
+    pipe = rs.pipeline(); cfg = rs.config()
+    cfg.enable_device(serial)
+    cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+    cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    prof = pipe.start(cfg); dev = prof.get_device()
+    try:
+        cs = dev.query_sensors()[1]
+        cs.set_option(rs.option.enable_auto_exposure, 0)
+        cs.set_option(rs.option.enable_auto_white_balance, 0)
+    except: pass
+    try: dev.first_depth_sensor().set_option(rs.option.enable_auto_exposure, 0)
+    except: pass
+    time.sleep(WARMUP)
+    ds = dev.first_depth_sensor().get_depth_scale()
+    vs = prof.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+    intr = o3d.camera.PinholeCameraIntrinsic(vs.width, vs.height, vs.fx, vs.fy, vs.ppx, vs.ppy)
+    align = rs.align(rs.stream.color)
+    print(f"→ Cam {serial} @{vs.width}×{vs.height}@30fps, depth_scale={ds:.4f}m")
+    return pipe, align, intr, ds
+
+def grab_one(pipe, align, ds):
+    for _ in range(GRAB_ATTEMPTS):
+        try:
+            fm = pipe.wait_for_frames(timeout_ms=GRAB_TIMEOUT)
+            al = align.process(fm)
+            d = np.asarray(al.get_depth_frame().get_data(), dtype=np.uint16)
+            c = np.asarray(al.get_color_frame().get_data(), dtype=np.uint8)
+            # camera gives BGR; convert to RGB for Open3D and tag
+            c_rgb = cv2.cvtColor(c, cv2.COLOR_BGR2RGB)
+            return o3d.geometry.RGBDImage.create_from_color_and_depth(
+                o3d.geometry.Image(c_rgb), o3d.geometry.Image(d),
+                depth_scale=1.0/ds, depth_trunc=DEPTH_TRUNC,
+                convert_rgb_to_intensity=False), c_rgb, d
+        except RuntimeError:
+            time.sleep(0.1)
+    raise RuntimeError("Failed to grab frame")
+
+def capture_seq(serial):
+    pipe, align, intr, ds = start_cam(serial)
+    rgbds, raws = [], []
+    for _ in tqdm(range(NUM_FRAMES), desc=f"Capturing cam {serial}"):
+        shots = [grab_one(pipe, align, ds) for __ in range(3)]
+        rgbds.append(shots[1]); raws.append(shots[1][1:])
+    pipe.stop()
+    return rgbds, intr, raws
+
+# === CLOUD BUILD ===
+def preprocess_cloud(pc):
+    pc = pc.voxel_down_sample(CLOUD_VOXEL)
+    if len(pc.points) == 0:
+        return pc
+    # Looser filter to avoid removing flat surfaces
+    try:
+        _, ind = pc.remove_statistical_outlier(nb_neighbors=16, std_ratio=2.0)
+        pc = pc.select_by_index(sorted(ind))
+    except Exception:
+        pass
+    if len(pc.points) == 0:
+        return pc
+    pc.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=CLOUD_VOXEL*3, max_nn=50))
+    return pc
+
+def build_cloud(rgbds, intr, label=""):
+    pcs = []
+    for r in tqdm(rgbds, desc=f"Building cloud{label}"):
+        pcs.append(o3d.geometry.PointCloud.create_from_rgbd_image(r[0], intr))
+    c = pcs[0]
+    for p in pcs[1:]: c += p
+    return preprocess_cloud(c)
+
+# === APRILTAG POSE ===
+def detect_tag_pose(color_img_rgb, intr, tid, tsize):
+    """
+    color_img_rgb is RGB (not BGR)
+    """
+    img = np.asarray(color_img_rgb)
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)  # <-- FIXED
+
+    dets = _tag_detector.detect(gray)
+    if VISUALIZE:
+        vis = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        if not dets: print("[AprilTag] none detected")
+        for d in dets:
+            pts = d.corners.astype(int).reshape(-1,1,2)
+            cv2.polylines(vis, [pts], True, (0,255,0), 2)
+            iid = d.tag_id if hasattr(d, 'tag_id') else d.id
+            cv2.putText(vis, f"ID={iid}", tuple(pts[0][0]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+        try:
+            cv2.imshow('AprilTag', vis); cv2.waitKey(300); cv2.destroyAllWindows()
+        except cv2.error:
+            pass
+
+    if not dets: raise RuntimeError('Tag not detected')
+    chosen = next((d for d in dets if (d.tag_id if hasattr(d, 'tag_id') else d.id)==tid), dets[0])
+
+    half = tsize / 2.0
+    objp = np.array([[-half,-half,0],[half,-half,0],[half,half,0],[-half,half,0]], dtype=np.float64)
+    imgp = chosen.corners.astype(np.float64)
+    K = intr.intrinsic_matrix
+    # EPnP + iterative refine helps tiny tags
+    ok, rvec, tvec = cv2.solvePnP(objp, imgp, K, None, flags=cv2.SOLVEPNP_EPNP)
+    if ok:
+        ok, rvec, tvec = cv2.solvePnP(objp, imgp, K, None, rvec, tvec, True, flags=cv2.SOLVEPNP_ITERATIVE)
+    if not ok: raise RuntimeError('solvePnP failed')
+    R, _ = cv2.Rodrigues(rvec)
+    T = np.eye(4); T[:3,:3] = R; T[:3,3] = tvec.ravel()
+    return T
+
+# === MAIN ===
+def main():
+    total_start = time.time()
+    print('Running AprilTag alignment...')
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = f"output_{timestamp}"; os.makedirs(out_dir, exist_ok=True)
+
+    # Capture
+    r0, i0, raw0 = capture_seq(SERIAL0)
+    r1, i1, raw1 = capture_seq(SERIAL1)
+
+    # Save RGB color images
+    for idx, raws in enumerate([raw0, raw1]):
+        color_np, depth_np = raws[0]
+        rgb_fn = os.path.join(out_dir, f"cam{idx}_color_{timestamp}.png")
+        cv2.imwrite(rgb_fn, cv2.cvtColor(color_np, cv2.COLOR_RGB2BGR))
+    print(f"Saved RGB images in {out_dir}")
+
+    # Build clouds
+    pc0_raw = build_cloud(r0, i0, label=" cam0")
+    pc1_raw = build_cloud(r1, i1, label=" cam1")
+    o3d.io.write_point_cloud(os.path.join(out_dir, f"cam0_raw_{timestamp}.ply"), pc0_raw)
+    o3d.io.write_point_cloud(os.path.join(out_dir, f"cam1_raw_{timestamp}.ply"), pc1_raw)
+
+    # Detect tags and align to tag frame
+    T0 = detect_tag_pose(raw0[0][0], i0, TAG_ID, TAG_SIZE)
+    T1 = detect_tag_pose(raw1[0][0], i1, TAG_ID, TAG_SIZE)
+    pc0_raw.transform(np.linalg.inv(T0))
+    pc1_raw.transform(np.linalg.inv(T1))
+
+    # Save aligned per-camera clouds
+    o3d.io.write_point_cloud(os.path.join(out_dir, f"cam0_aligned_{timestamp}.ply"), pc0_raw)
+    o3d.io.write_point_cloud(os.path.join(out_dir, f"cam1_aligned_{timestamp}.ply"), pc1_raw)
+
+    # === ICP on downsampled copies ===
+    T_full = np.eye(4)
+
+    # Create lighter ICP copies
+    pc0_icp = pc0_raw.voxel_down_sample(ICP_VOXEL)
+    pc1_icp = pc1_raw.voxel_down_sample(ICP_VOXEL)
+
+    # Local around tag (wider XY, small Z band)
+    half_xy = max(TAG_SIZE * 1.5, 0.02)  # at least 2 cm
+    half_z  = 0.02
+    bbox = o3d.geometry.AxisAlignedBoundingBox([-half_xy,-half_xy,-half_z],
+                                               [ half_xy, half_xy, half_z])
+    sub0, sub1 = pc0_icp.crop(bbox), pc1_icp.crop(bbox)
+    if len(sub0.points)>200 and len(sub1.points)>200:
+        res_loc = o3d.pipelines.registration.registration_icp(
+            sub1, sub0, ICP_DIST_LOCAL, np.eye(4),
+            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=60))
+        T_full = res_loc.transformation @ T_full
+        pc1_icp.transform(res_loc.transformation)
+    else:
+        print(f"[Local ICP] Skipped (sub0={len(sub0.points)}, sub1={len(sub1.points)})")
+
+    # Global ICP
+    res_glob = o3d.pipelines.registration.registration_icp(
+        pc1_icp, pc0_icp, ICP_DIST_GLOBAL, np.eye(4),
+        o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=80))
+    T_full = res_glob.transformation @ T_full
+
+    # Apply ICP transform to the high-detail cloud
+    pc1_raw.transform(T_full)
+
+    # Manual tweaks (optional)
+    if any(FINAL_TRANSLATION):
+        Tt = np.eye(4); Tt[:3,3] = FINAL_TRANSLATION
+        pc1_raw.transform(Tt); T_full = Tt @ T_full
+    if any(FINAL_ROTATION_DEG):
+        r,p,y = np.radians(FINAL_ROTATION_DEG)
+        Rx = np.array([[1,0,0],[0,np.cos(r),-np.sin(r)],[0,np.sin(r),np.cos(r)]])
+        Ry = np.array([[np.cos(p),0,np.sin(p)],[0,1,0],[-np.sin(p),0,np.cos(p)]])
+        Rz = np.array([[np.cos(y),-np.sin(y),0],[np.sin(y),np.cos(y),0],[0,0,1]])
+        Rm = Rz @ Ry @ Rx; Tr = np.eye(4); Tr[:3,:3] = Rm
+        pc1_raw.transform(Tr); T_full = Tr @ T_full
+
+    # Final merge (optional write-downsample)
+    merged = pc0_raw + pc1_raw
+    merged = merged.voxel_down_sample(VOXEL_SIZE_WRITE)
+    merged_fn = os.path.join(out_dir, f"merged_{timestamp}.ply")
+    o3d.io.write_point_cloud(merged_fn, merged)
+
+    # Save alignment matrix (cam1→cam0)
+    T_cam1_to_cam0 = np.linalg.inv(T0) @ T_full @ T1
+    np.save(os.path.join(out_dir, f"align_matrix_{timestamp}.npy"), T_cam1_to_cam0)
+
+    total_end = time.time()
+    print(f"Saved all outputs in {out_dir}")
+    print(f"Total runtime: {total_end - total_start:.2f} seconds.")
+
+if __name__=='__main__':
+    main()
