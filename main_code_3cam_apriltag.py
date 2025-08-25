@@ -73,12 +73,12 @@ SERIAL2            = '252222300763'
 TAG_ID             = 3              # AprilTag ID
 TAG_SIZE           = 0.074          # meters
 NUM_FRAMES         = 12            # ↑ more frames → better TSDF fill
-WARMUP             = 1.0
+WARMUP             = 3.0
 GRAB_ATTEMPTS      = 30             # Increased from 10
-GRAB_TIMEOUT       = 5000           # Increased from 2000
+GRAB_TIMEOUT       = 12000           # Increased from 2000
 FRAME_WAIT         = 0.1            # Wait between frame attempts
 VOXEL_SIZE         = 1e-8           # per-cam: effectively no downsample
-DEPTH_TRUNC        = 1.0
+DEPTH_TRUNC        = 1.2
 VISUALIZE          = True
 FINAL_TRANSLATION  = [0.0, 0.0, 0.0]
 FINAL_ROTATION_DEG = [0.0, 0.0, 0.0]
@@ -104,7 +104,7 @@ THIN_MIN_PTS        = 1         # keep any point with >=1 neighbor
 
 # TSDF fusion
 DO_TSDF             = True
-TSDF_VOXEL          = 0.001     # 1 mm
+TSDF_VOXEL          = 0.0008     # 1 mm
 TSDF_TRUNC_MULT     = 6.0       # more aggressive hole fill
 
 # Recovery settings
