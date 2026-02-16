@@ -64,6 +64,18 @@ def diameter_from_slice(points_slice, center, axis, robust_q):
     return 2.0 * rad, rad
 
 
+# ---- Added: frustum approximation for volume/surface area (cm units) ----
+def frustum_volume_cm3(r1_cm, r2_cm, h_cm):
+    # V = (pi*h/3)*(r1^2 + r1*r2 + r2^2)
+    return (np.pi * h_cm / 3.0) * (r1_cm * r1_cm + r1_cm * r2_cm + r2_cm * r2_cm)
+
+
+def frustum_lateral_area_cm2(r1_cm, r2_cm, h_cm):
+    # lateral area only: A = pi*(r1+r2)*s, s = sqrt((r1-r2)^2 + h^2)
+    s = np.sqrt((r1_cm - r2_cm) ** 2 + h_cm ** 2)
+    return np.pi * (r1_cm + r2_cm) * s
+
+
 # -------------------------
 # Open3D helpers
 # -------------------------
@@ -281,6 +293,10 @@ def main():
     labels = []
     rows = []
 
+    # ---- Added: keep ring radii + axial positions for volume/area ----
+    ring_t_cm = []
+    ring_r_cm = []
+
     L_cm = L_raw * UNIT_SCALE_TO_CM
     print("\n=== VALUES (cm) ===")
     print(f"L = {L_cm:.2f} cm\n")
@@ -294,12 +310,20 @@ def main():
         col = palette[(i - 1) % len(palette)]
 
         if n_in < 80:
-            rows.append([i, pos01, np.nan, n_in])
+            rows.append([i, pos01, np.nan, np.nan, np.nan, n_in])
             continue
 
         d_raw, r_raw = diameter_from_slice(pts[mask], center, axis, ROBUST_Q)
         d_cm = d_raw * UNIT_SCALE_TO_CM
-        rows.append([i, pos01, d_cm, n_in])
+        r_cm = r_raw * UNIT_SCALE_TO_CM
+        t_cm = (t0 - t_min) * UNIT_SCALE_TO_CM  # axial position from start (cm)
+
+        # store for frustum approx
+        ring_t_cm.append(t_cm)
+        ring_r_cm.append(r_cm)
+
+        # ---- Added: save more columns ----
+        rows.append([i, pos01, pos01 * 100.0, d_cm, r_cm, t_cm, n_in])
 
         c3 = center + t0 * axis
         ring, u_ring, v_ring = make_ring(c3, axis, r_raw, color=col, n=220)
@@ -326,6 +350,35 @@ def main():
         labels.append(place_label_lineset(label_local, label_origin, u_text, v_text))
 
         print(f"Ring {i:02d} @ {pos01*100:5.1f}%  D = {d_cm:6.2f} cm  (slice n={n_in})")
+
+    # ---- Added: compute average diameter, volume, surface area ----
+    d_list = [r[3] for r in rows if (len(r) > 3 and isinstance(r[3], (float, np.floating)) and not np.isnan(r[3]))]
+    avg_d_cm = float(np.mean(d_list)) if len(d_list) else float("nan")
+
+    vol_cm3 = float("nan")
+    area_cm2 = float("nan")
+    if len(ring_r_cm) >= 2:
+        ring_t_cm = np.array(ring_t_cm, dtype=float)
+        ring_r_cm = np.array(ring_r_cm, dtype=float)
+        idx = np.argsort(ring_t_cm)
+        ring_t_cm = ring_t_cm[idx]
+        ring_r_cm = ring_r_cm[idx]
+
+        v = 0.0
+        a = 0.0
+        for k in range(len(ring_r_cm) - 1):
+            h = float(ring_t_cm[k + 1] - ring_t_cm[k])
+            r1 = float(ring_r_cm[k])
+            r2 = float(ring_r_cm[k + 1])
+            v += frustum_volume_cm3(r1, r2, h)
+            a += frustum_lateral_area_cm2(r1, r2, h)
+        vol_cm3 = v
+        area_cm2 = a
+
+    print("\n=== SUMMARY (computed from rings) ===")
+    print(f"Average diameter = {avg_d_cm:.2f} cm")
+    print(f"Approx volume    = {vol_cm3:.1f} cm3")
+    print(f"Approx area      = {area_cm2:.1f} cm2  (lateral only)\n")
 
     # ---- Length label in 3D (better positioned using first ring outward direction) ----
     if SHOW_LENGTH_LABEL:
@@ -354,12 +407,25 @@ def main():
         origin = (p1 - (L_LABEL_ALONG_AXIS * L_raw) * axis) + (L_LABEL_OUTWARD * L_raw) * out_dir
         labels.append(place_label_lineset(L_label_local, origin, uL, vL))
 
-    # save csv
-    df = pd.DataFrame(rows, columns=["ring_id", "pos_0to1", "diameter_cm", "slice_points"])
+    # save csv (now includes diameter, radius, axial position)
+    df = pd.DataFrame(
+        rows,
+        columns=["ring_id", "pos_0to1", "pos_percent", "diameter_cm", "radius_cm", "t_cm_from_start", "slice_points"]
+    )
     if SAVE_CSV:
         out_csv = os.path.splitext(IN_PATH)[0] + "_ring_values_cm.csv"
         df.to_csv(out_csv, index=False)
-        print(f"\nSaved CSV: {out_csv}")
+        print(f"Saved CSV: {out_csv}")
+
+        # also save a small summary csv (optional, same folder)
+        summary_csv = os.path.splitext(IN_PATH)[0] + "_summary_cm.csv"
+        pd.DataFrame([{
+            "length_cm": L_cm,
+            "avg_diameter_cm": avg_d_cm,
+            "approx_volume_cm3": vol_cm3,
+            "approx_area_cm2": area_cm2
+        }]).to_csv(summary_csv, index=False)
+        print(f"Saved summary CSV: {summary_csv}")
 
     geoms = [pcd, axis_ls] + rings + labels
     vis = o3d.visualization.Visualizer()
