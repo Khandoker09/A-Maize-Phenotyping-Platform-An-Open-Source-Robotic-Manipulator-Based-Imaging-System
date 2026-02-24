@@ -6,40 +6,123 @@ import open3d as o3d
 # =======================
 # CONFIG
 # =======================
-IN_PATH = "finalcob.pcd"
+IN_PATH = "presentation.ply"
+UNIT_SCALE_TO_CM = 10.0  # dm->cm
 
-N_RINGS = 15
-START_POS = 0.05
-END_POS = 0.95
-SLICE_THICKNESS_FRAC = 0.02
-ROBUST_Q = 0.95
+# Rings
+N_RINGS = 55
+SLICE_THICKNESS_FRAC = 0.012
+
+# Outlier removal
 REMOVE_OUTLIERS = True
+OUTLIER_NB_NEIGHBORS = 30
+OUTLIER_STD_RATIO = 2.5
 
+# Body detection (rough, on coarse axis)
+PROFILE_SAMPLES = 240
+PROFILE_SLICE_FRAC = 0.010
+PROFILE_SMOOTH_WIN = 11
+BODY_THRESH_FRAC = 0.18
+BODY_GAP_FILL = 5
+
+# Ring placement margins (avoid messy tips)
+SKIP_END_FRAC = 0.03
+
+# Length touching (along curved centerline)
+LENGTH_TOUCH_MARGIN_FRAC = 0.02
+
+# Outer radius method (prevents rings going inside)
+ANGLE_BINS = 240
+RADIAL_CAP_Q = 0.995
+OUTER_SMOOTH_WIN = 5  # smooth radii along the cob (odd: 3/5/7). set 0 to disable.
+
+# Ring thickness
+RING_TUBE_FRAC = 0.018  # tube radius = this * ring_radius
+
+# Curved centerline
+CENTERLINE_SAMPLES = 120          # number of slabs for centerline extraction
+CENTERLINE_SLICE_FRAC = 0.010     # slab thickness as fraction of body length
+CENTERLINE_SMOOTH_WIN = 9         # smooth centerline points (odd: 7/9/11)
+
+# Average diameter
+AVG_MODE = "mid"
+MID_FRAC_LOW = 0.10
+MID_FRAC_HIGH = 0.90
+
+# Visualization
 POINT_SIZE = 2.5
+BACKGROUND = np.array([0.05, 0.05, 0.05])
+
 SAVE_CSV = True
-
-# If your cloud units are decimeters (dm) and you want centimeters:
-UNIT_SCALE_TO_CM = 10.0   # dm -> cm  (change to 100.0 if units are meters)
-
-LABEL_SCALE = 0.10
-LABEL_OFFSET = 1.15
-LABEL_COLOR = (1.0, 1.0, 1.0)
-WORLD_UP = np.array([0.0, 0.0, 1.0])
-
-LETTER_SCALE_MULT = 1.0
-LETTER_GAP_MULT = 0.45
-
-# Better L label positioning:
-SHOW_LENGTH_LABEL = True
-L_LABEL_SCALE_FRAC_OF_LENGTH = 0.06   # text size ~ fraction of length
-L_LABEL_ALONG_AXIS = 0.02             # move from tip along axis (in length fraction)
-L_LABEL_OUTWARD = 0.22                # move outward from cob (in length fraction)
 # =======================
 
 
 # -------------------------
-# Measurement helpers
+# Helpers
 # -------------------------
+def moving_average(x, win):
+    win = int(win)
+    if win <= 1:
+        return x
+    if win % 2 == 0:
+        win += 1
+    pad = win // 2
+    xp = np.pad(x, ((pad, pad), (0, 0)), mode="edge")
+    k = np.ones(win) / win
+    y = np.empty_like(xp[pad:-pad])
+    for d in range(x.shape[1]):
+        y[:, d] = np.convolve(xp[:, d], k, mode="valid")
+    return y
+
+
+def moving_average_1d(x, win):
+    win = int(win)
+    if win <= 1:
+        return x
+    if win % 2 == 0:
+        win += 1
+    pad = win // 2
+    xp = np.pad(x, (pad, pad), mode="edge")
+    k = np.ones(win) / win
+    return np.convolve(xp, k, mode="valid")
+
+
+def fill_small_gaps(mask, max_gap):
+    mask = mask.copy()
+    n = len(mask)
+    i = 0
+    while i < n:
+        if mask[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not mask[j]:
+            j += 1
+        gap_len = j - i
+        if i > 0 and j < n and mask[i - 1] and mask[j] and gap_len <= max_gap:
+            mask[i:j] = True
+        i = j
+    return mask
+
+
+def largest_true_segment(mask):
+    best = (None, None, 0)
+    n = len(mask)
+    i = 0
+    while i < n:
+        if not mask[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and mask[j]:
+            j += 1
+        length = j - i
+        if length > best[2]:
+            best = (i, j, length)
+        i = j
+    return best[0], best[1]
+
+
 def pca_axis(points: np.ndarray):
     center = points.mean(axis=0)
     X = points - center
@@ -55,207 +138,210 @@ def slice_mask(points, center, axis, t0, half_thickness):
     return (t >= (t0 - half_thickness)) & (t <= (t0 + half_thickness))
 
 
-def diameter_from_slice(points_slice, center, axis, robust_q):
-    t = (points_slice - center) @ axis
-    proj = np.outer(t, axis)
-    radial = (points_slice - center) - proj
-    r = np.linalg.norm(radial, axis=1)
-    rad = float(np.quantile(r, robust_q))
-    return 2.0 * rad, rad
-
-
-# ---- Added: frustum approximation for volume/surface area (cm units) ----
-def frustum_volume_cm3(r1_cm, r2_cm, h_cm):
-    # V = (pi*h/3)*(r1^2 + r1*r2 + r2^2)
-    return (np.pi * h_cm / 3.0) * (r1_cm * r1_cm + r1_cm * r2_cm + r2_cm * r2_cm)
-
-
-def frustum_lateral_area_cm2(r1_cm, r2_cm, h_cm):
-    # lateral area only: A = pi*(r1+r2)*s, s = sqrt((r1-r2)^2 + h^2)
-    s = np.sqrt((r1_cm - r2_cm) ** 2 + h_cm ** 2)
-    return np.pi * (r1_cm + r2_cm) * s
-
-
-# -------------------------
-# Open3D helpers
-# -------------------------
-def make_lineset(points, lines, colors):
-    ls = o3d.geometry.LineSet()
-    ls.points = o3d.utility.Vector3dVector(points)
-    ls.lines = o3d.utility.Vector2iVector(lines)
-    ls.colors = o3d.utility.Vector3dVector(colors)
-    return ls
-
-
-def merge_linesets(linesets):
-    all_pts = []
-    all_lines = []
-    all_cols = []
-    base = 0
-    for ls in linesets:
-        pts = np.asarray(ls.points)
-        lines = np.asarray(ls.lines)
-        cols = np.asarray(ls.colors)
-        all_pts.extend(pts.tolist())
-        all_lines.extend((lines + base).tolist())
-        all_cols.extend(cols.tolist())
-        base += len(pts)
-    return make_lineset(np.array(all_pts, float), np.array(all_lines, int), np.array(all_cols, float))
-
-
-def make_axis_lineset(p0, p1, color=(1, 0, 0)):
-    pts = np.vstack([p0, p1])
-    lines = np.array([[0, 1]], dtype=np.int32)
-    cols = np.array([color], dtype=np.float64)
-    return make_lineset(pts, lines, cols)
-
-
-def make_ring(center3d, axis_unit, radius, color=(0, 1, 0), n=180):
-    axis_unit = axis_unit / np.linalg.norm(axis_unit)
-
+def plane_basis(normal):
+    normal = normal / np.linalg.norm(normal)
     tmp = np.array([1.0, 0.0, 0.0])
-    if abs(np.dot(tmp, axis_unit)) > 0.9:
+    if abs(np.dot(tmp, normal)) > 0.9:
         tmp = np.array([0.0, 1.0, 0.0])
-    u = np.cross(axis_unit, tmp)
-    u = u / np.linalg.norm(u)
-    v = np.cross(axis_unit, u)
-
-    angles = np.linspace(0, 2*np.pi, n, endpoint=False)
-    ring_pts = np.array([center3d + radius*(np.cos(a)*u + np.sin(a)*v) for a in angles])
-
-    lines = np.array([[i, (i+1) % n] for i in range(n)], dtype=np.int32)
-    cols = np.tile(np.array(color, dtype=np.float64), (len(lines), 1))
-    ring = make_lineset(ring_pts, lines, cols)
-    return ring, u, v
-
-
-def build_label_basis(out_dir, world_up):
-    n = out_dir / np.linalg.norm(out_dir)
-    up = world_up / np.linalg.norm(world_up)
-    v = up - np.dot(up, n) * n
-    if np.linalg.norm(v) < 1e-9:
-        up = np.array([0.0, 1.0, 0.0])
-        v = up - np.dot(up, n) * n
-    v = v / np.linalg.norm(v)
-    u = np.cross(v, n)
-    u = u / np.linalg.norm(u)
+    u = np.cross(normal, tmp); u /= np.linalg.norm(u)
+    v = np.cross(normal, u)
     return u, v
 
 
-def place_label_lineset(label_ls, origin3d, u, v):
-    pts2 = np.asarray(label_ls.points)
-    pts3 = origin3d + pts2[:, 0:1]*u.reshape(1, 3) + pts2[:, 1:2]*v.reshape(1, 3)
-    label_ls.points = o3d.utility.Vector3dVector(pts3)
-    return label_ls
+def radius_quantile(points_slice, center, axis, q=0.90):
+    axis = axis / np.linalg.norm(axis)
+    u, v = plane_basis(axis)
+    t = (points_slice - center) @ axis
+    t0 = float(np.median(t))
+    plane_center = center + t0 * axis
+    rel = points_slice - plane_center
+    x = rel @ u
+    y = rel @ v
+    r = np.sqrt(x * x + y * y)
+    if len(r) < 10:
+        return np.nan
+    rcap = np.quantile(r, 0.98)
+    r = r[r <= rcap]
+    return float(np.quantile(r, q))
+
+
+def detect_body_interval(pts, center, axis, t_full_min, t_full_max):
+    L_full = t_full_max - t_full_min
+    half_th = 0.5 * (PROFILE_SLICE_FRAC * L_full)
+    ts = np.linspace(t_full_min, t_full_max, PROFILE_SAMPLES)
+    radii = np.full_like(ts, np.nan, dtype=float)
+
+    for i, t0 in enumerate(ts):
+        mask = slice_mask(pts, center, axis, t0, half_th)
+        if mask.sum() < 100:
+            continue
+        radii[i] = radius_quantile(pts[mask], center, axis, q=0.90)
+
+    valid = np.isfinite(radii)
+    if valid.sum() < 10:
+        return np.quantile(ts, 0.02), np.quantile(ts, 0.98)
+
+    # fill nans
+    rid = radii.copy()
+    last = None
+    for i in range(len(rid)):
+        if np.isfinite(rid[i]):
+            last = rid[i]
+        elif last is not None:
+            rid[i] = last
+    last = None
+    for i in range(len(rid) - 1, -1, -1):
+        if np.isfinite(rid[i]):
+            last = rid[i]
+        elif last is not None:
+            rid[i] = last
+
+    rid = moving_average_1d(rid, PROFILE_SMOOTH_WIN)
+
+    rmax = float(np.nanmax(rid))
+    thr = BODY_THRESH_FRAC * rmax
+    body = rid >= thr
+    body = fill_small_gaps(body, BODY_GAP_FILL)
+
+    s, e = largest_true_segment(body)
+    if s is None:
+        return np.quantile(ts, 0.02), np.quantile(ts, 0.98)
+
+    return float(ts[s]), float(ts[e - 1])
 
 
 # -------------------------
-# 7-seg digits
+# Curved centerline
 # -------------------------
-SEG = {
-    "a": ((0.1, 2.0), (0.9, 2.0)),
-    "b": ((0.9, 2.0), (0.9, 1.1)),
-    "c": ((0.9, 0.9), (0.9, 0.0)),
-    "d": ((0.1, 0.0), (0.9, 0.0)),
-    "e": ((0.1, 0.0), (0.1, 0.9)),
-    "f": ((0.1, 1.1), (0.1, 2.0)),
-    "g": ((0.1, 1.0), (0.9, 1.0)),
-}
-DIGIT_TO_SEGS = {
-    "0": "abcdef",
-    "1": "bc",
-    "2": "abged",
-    "3": "abgcd",
-    "4": "fgbc",
-    "5": "afgcd",
-    "6": "afgcde",
-    "7": "abc",
-    "8": "abcdefg",
-    "9": "abfgcd",
-    "-": "g",
-}
+def build_centerline(pts, center, axis, t_body_min, t_body_max):
+    L_body = t_body_max - t_body_min
+    half_th = 0.5 * (CENTERLINE_SLICE_FRAC * L_body)
 
-def make_7seg_char(ch, origin2d, s, color):
-    ox, oy = origin2d
-    pts, lines, cols = [], [], []
+    ts = np.linspace(t_body_min, t_body_max, CENTERLINE_SAMPLES)
+    cl = []
+    valid_t = []
 
-    def add_line(p, q):
-        i0 = len(pts)
-        pts.append([p[0], p[1], 0.0])
-        pts.append([q[0], q[1], 0.0])
-        lines.append([i0, i0 + 1])
-        cols.append(color)
+    for t0 in ts:
+        m = slice_mask(pts, center, axis, t0, half_th)
+        if m.sum() < 200:
+            continue
+        cl.append(pts[m].mean(axis=0))
+        valid_t.append(t0)
 
-    if ch in DIGIT_TO_SEGS:
-        for segname in DIGIT_TO_SEGS[ch]:
-            p, q = SEG[segname]
-            p2 = (ox + s * p[0], oy + s * p[1])
-            q2 = (ox + s * q[0], oy + s * q[1])
-            add_line(p2, q2)
-    elif ch == ".":
-        add_line((ox + s * 0.9, oy + s * 0.1), (ox + s * 0.9, oy + s * 0.25))
+    cl = np.array(cl, float)
+    valid_t = np.array(valid_t, float)
 
-    return make_lineset(np.array(pts, float), np.array(lines, int), np.array(cols, float))
+    if len(cl) < 10:
+        # fallback: straight line
+        p0 = center + t_body_min * axis
+        p1 = center + t_body_max * axis
+        return np.vstack([p0, p1]), np.array([t_body_min, t_body_max])
+
+    cl_s = moving_average(cl, CENTERLINE_SMOOTH_WIN)
+    return cl_s, valid_t
 
 
-def make_7seg_string(text, s, color):
-    char_w = 1.2 * s
-    x = 0.0
-    parts = []
-    for ch in text:
-        parts.append(make_7seg_char(ch, origin2d=(x, 0.0), s=s, color=color))
-        x += char_w
-    return merge_linesets(parts), x
+def centerline_arclength(cl):
+    d = np.linalg.norm(np.diff(cl, axis=0), axis=1)
+    s = np.concatenate([[0.0], np.cumsum(d)])
+    return s
+
+
+def sample_centerline_by_arclength(cl, s, s_query):
+    # piecewise linear interpolation along arc length
+    s_query = np.clip(s_query, s[0], s[-1])
+    idx = np.searchsorted(s, s_query, side="right") - 1
+    idx = np.clip(idx, 0, len(s) - 2)
+    t = (s_query - s[idx]) / np.maximum(s[idx + 1] - s[idx], 1e-12)
+    p = (1 - t)[:, None] * cl[idx] + t[:, None] * cl[idx + 1]
+    return p, idx, t
+
+
+def tangent_from_centerline(cl, i):
+    if i <= 0:
+        v = cl[1] - cl[0]
+    elif i >= len(cl) - 1:
+        v = cl[-1] - cl[-2]
+    else:
+        v = cl[i + 1] - cl[i - 1]
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-12 else np.array([0.0, 0.0, 1.0])
 
 
 # -------------------------
-# Stroke letters: c, m, L, =
+# Outer radius using local tangent plane
 # -------------------------
-def stroke_letter(letter, origin2d, s, color):
-    ox, oy = origin2d
-    segs = []
-    def seg(p, q):
-        segs.append(((ox + s * p[0], oy + s * p[1]), (ox + s * q[0], oy + s * q[1])))
+def outer_radius_angle_binned(points_slice, plane_center, normal, bins=240, cap_q=0.995):
+    u, v = plane_basis(normal)
 
-    if letter == "c":
-        seg((0.9, 1.7), (0.4, 2.0))
-        seg((0.4, 2.0), (0.1, 1.5))
-        seg((0.1, 1.5), (0.1, 0.5))
-        seg((0.1, 0.5), (0.4, 0.0))
-        seg((0.4, 0.0), (0.9, 0.3))
-    elif letter == "m":
-        seg((0.1, 0.0), (0.1, 2.0))
-        seg((0.1, 2.0), (0.5, 1.2))
-        seg((0.5, 1.2), (0.9, 2.0))
-        seg((0.9, 2.0), (0.9, 0.0))
-    elif letter == "L":
-        seg((0.1, 2.0), (0.1, 0.0))
-        seg((0.1, 0.0), (0.9, 0.0))
-    elif letter == "=":
-        seg((0.1, 1.35), (0.9, 1.35))
-        seg((0.1, 0.65), (0.9, 0.65))
+    rel = points_slice - plane_center
+    x = rel @ u
+    y = rel @ v
+    ang = np.arctan2(y, x)
+    r = np.sqrt(x * x + y * y)
 
-    pts = []
-    lines = []
-    cols = []
-    for p, q in segs:
-        i0 = len(pts)
-        pts.append([p[0], p[1], 0.0])
-        pts.append([q[0], q[1], 0.0])
-        lines.append([i0, i0 + 1])
-        cols.append(color)
+    if len(r) < 50:
+        return np.nan
 
-    return make_lineset(np.array(pts, float), np.array(lines, int), np.array(cols, float))
+    rcap = np.quantile(r, cap_q)
+    keep = r <= rcap
+    ang = ang[keep]
+    r = r[keep]
+
+    edges = np.linspace(-np.pi, np.pi, bins + 1)
+    rmax_bins = []
+    for i in range(bins):
+        m = (ang >= edges[i]) & (ang < edges[i + 1])
+        if np.any(m):
+            rmax_bins.append(np.max(r[m]))
+
+    if len(rmax_bins) < max(20, bins * 0.15):
+        return float(np.quantile(r, 0.97))
+
+    return float(np.median(np.array(rmax_bins)))
 
 
-def make_stroke_word(word, start_x, s, color):
-    char_w = 1.2 * s
-    x = start_x
-    parts = []
-    for ch in word:
-        parts.append(stroke_letter(ch, origin2d=(x, 0.0), s=s, color=color))
-        x += char_w
-    return merge_linesets(parts), x
+# -------------------------
+# Draw torus ring
+# -------------------------
+def rotation_from_z_to_vec(v):
+    v = v / np.linalg.norm(v)
+    z = np.array([0.0, 0.0, 1.0])
+    if np.allclose(v, z):
+        return np.eye(3)
+    if np.allclose(v, -z):
+        return np.array([[1, 0, 0],
+                         [0,-1, 0],
+                         [0, 0,-1]], dtype=float)
+    axis = np.cross(z, v)
+    axis = axis / np.linalg.norm(axis)
+    angle = np.arccos(np.clip(np.dot(z, v), -1.0, 1.0))
+    K = np.array([[0, -axis[2], axis[1]],
+                  [axis[2], 0, -axis[0]],
+                  [-axis[1], axis[0], 0]], dtype=float)
+    R = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
+    return R
+
+
+def make_torus_ring(center, normal, ring_radius, tube_frac, color_rgb):
+    tube = max(ring_radius * tube_frac, 1e-6)
+    torus = o3d.geometry.TriangleMesh.create_torus(torus_radius=ring_radius, tube_radius=tube)
+    torus.compute_vertex_normals()
+    torus.paint_uniform_color(color_rgb)
+    R = rotation_from_z_to_vec(normal)
+    torus.rotate(R, center=(0, 0, 0))
+    torus.translate(center)
+    return torus
+
+
+def make_polyline(points, color=(1, 0, 0)):
+    points = np.asarray(points, float)
+    lines = np.array([[i, i + 1] for i in range(len(points) - 1)], dtype=np.int32)
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(points)
+    ls.lines = o3d.utility.Vector2iVector(lines)
+    ls.colors = o3d.utility.Vector3dVector(np.tile(np.array(color, float), (len(lines), 1)))
+    return ls
 
 
 # -------------------------
@@ -263,23 +349,49 @@ def make_stroke_word(word, start_x, s, color):
 # -------------------------
 def main():
     pcd = o3d.io.read_point_cloud(IN_PATH)
+    if len(pcd.points) == 0:
+        raise RuntimeError("No points found in input PLY")
+
     if REMOVE_OUTLIERS:
-        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=30, std_ratio=4.0)
+        pcd, _ = pcd.remove_statistical_outlier(OUTLIER_NB_NEIGHBORS, OUTLIER_STD_RATIO)
 
     pts = np.asarray(pcd.points)
-    center, axis = pca_axis(pts)
+    center, coarse_axis = pca_axis(pts)
+    t_all = (pts - center) @ coarse_axis
 
-    t_all = (pts - center) @ axis
-    t_min, t_max = float(t_all.min()), float(t_all.max())
-    L_raw = t_max - t_min
+    t_full_min = float(np.quantile(t_all, 0.001))
+    t_full_max = float(np.quantile(t_all, 0.999))
 
-    # axis
-    p0 = center + t_min * axis
-    p1 = center + t_max * axis
-    axis_ls = make_axis_lineset(p0, p1, color=(1, 0, 0))
+    # Body interval on coarse axis
+    t_body_min, t_body_max = detect_body_interval(pts, center, coarse_axis, t_full_min, t_full_max)
+    L_body = t_body_max - t_body_min
 
-    half_thick = 0.5 * (SLICE_THICKNESS_FRAC * L_raw)
-    positions = np.linspace(START_POS, END_POS, N_RINGS)
+    # Build curved centerline (centroids of slabs)
+    cl, cl_t = build_centerline(pts, center, coarse_axis, t_body_min, t_body_max)
+    s = centerline_arclength(cl)
+
+    # Length endpoints along centerline (touching)
+    s_min = max(0.0, s[0] - 0.0)
+    s_max = s[-1]
+    s_touch = LENGTH_TOUCH_MARGIN_FRAC * (s_max - s_min)
+    s_len_min = max(s_min, s_min - 0.0)  # already 0
+    s_len_max = min(s_max, s_max + 0.0)  # already max
+    # extend a bit by clamping to ends (visual touch by using endpoints anyway)
+    # (If you want extra: you can reduce body threshold instead of extrapolating.)
+    p_len0 = cl[0]
+    p_len1 = cl[-1]
+
+    # Ring placement along centerline (skip messy ends)
+    s0 = s_min + SKIP_END_FRAC * (s_max - s_min)
+    s1 = s_max - SKIP_END_FRAC * (s_max - s_min)
+    ring_s = np.linspace(s0, s1, N_RINGS)
+
+    ring_centers, idxs, _ = sample_centerline_by_arclength(cl, s, ring_s)
+    ring_normals = np.array([tangent_from_centerline(cl, int(i)) for i in idxs])
+
+    # For slicing: we still use coarse axis just to pick nearby points efficiently.
+    # But for radius, we project onto the local ring plane.
+    half_thick = 0.5 * (SLICE_THICKNESS_FRAC * (t_body_max - t_body_min))
 
     palette = [
         (0.0, 1.0, 0.0),
@@ -289,152 +401,99 @@ def main():
         (1.0, 0.4, 0.2),
     ]
 
-    rings = []
-    labels = []
+    ring_radii = np.full(N_RINGS, np.nan, float)
     rows = []
 
-    # ---- Added: keep ring radii + axial positions for volume/area ----
-    ring_t_cm = []
-    ring_r_cm = []
+    # precompute coarse t for all points (speed)
+    t_pts = (pts - center) @ coarse_axis
+    # also coarse t for ring centers
+    t_ring = (ring_centers - center) @ coarse_axis
 
-    L_cm = L_raw * UNIT_SCALE_TO_CM
-    print("\n=== VALUES (cm) ===")
-    print(f"L = {L_cm:.2f} cm\n")
-
-    first_out_dir = None  # use for L label placement
-
-    for i, pos01 in enumerate(positions, start=1):
-        t0 = t_min + pos01 * (t_max - t_min)
-        mask = slice_mask(pts, center, axis, t0, half_thick)
-        n_in = int(mask.sum())
-        col = palette[(i - 1) % len(palette)]
-
-        if n_in < 80:
-            rows.append([i, pos01, np.nan, np.nan, np.nan, n_in])
+    for i in range(N_RINGS):
+        # pick slab by coarse t around this ring center
+        m = (t_pts >= (t_ring[i] - half_thick)) & (t_pts <= (t_ring[i] + half_thick))
+        n_in = int(m.sum())
+        if n_in < 250:
+            rows.append([i + 1, float(ring_s[i]), np.nan, np.nan, n_in])
             continue
 
-        d_raw, r_raw = diameter_from_slice(pts[mask], center, axis, ROBUST_Q)
-        d_cm = d_raw * UNIT_SCALE_TO_CM
-        r_cm = r_raw * UNIT_SCALE_TO_CM
-        t_cm = (t0 - t_min) * UNIT_SCALE_TO_CM  # axial position from start (cm)
+        r_outer = outer_radius_angle_binned(
+            pts[m],
+            plane_center=ring_centers[i],
+            normal=ring_normals[i],
+            bins=ANGLE_BINS,
+            cap_q=RADIAL_CAP_Q
+        )
 
-        # store for frustum approx
-        ring_t_cm.append(t_cm)
-        ring_r_cm.append(r_cm)
+        ring_radii[i] = r_outer
+        rows.append([i + 1, float(ring_s[i]), 2.0 * r_outer * UNIT_SCALE_TO_CM, r_outer * UNIT_SCALE_TO_CM, n_in])
 
-        # ---- Added: save more columns ----
-        rows.append([i, pos01, pos01 * 100.0, d_cm, r_cm, t_cm, n_in])
+    # Smooth radii along centerline
+    valid = np.isfinite(ring_radii)
+    if OUTER_SMOOTH_WIN > 1 and valid.sum() >= OUTER_SMOOTH_WIN:
+        rr = ring_radii.copy()
+        idx = np.arange(len(rr))
+        rr[~valid] = np.interp(idx[~valid], idx[valid], rr[valid])
+        rr = moving_average_1d(rr, OUTER_SMOOTH_WIN)
+        ring_radii[valid] = rr[valid]
 
-        c3 = center + t0 * axis
-        ring, u_ring, v_ring = make_ring(c3, axis, r_raw, color=col, n=220)
-        rings.append(ring)
+    # Build ring meshes
+    ring_geoms = []
+    for i in range(N_RINGS):
+        if not np.isfinite(ring_radii[i]):
+            continue
+        col = palette[i % len(palette)]
+        ring_geoms.append(
+            make_torus_ring(
+                center=ring_centers[i],
+                normal=ring_normals[i],
+                ring_radius=float(ring_radii[i]),
+                tube_frac=RING_TUBE_FRAC,
+                color_rgb=col
+            )
+        )
 
-        # remember an outward direction from the first valid ring
-        if first_out_dir is None:
-            first_out_dir = u_ring.copy()
+    # Curved length polyline
+    length_line = make_polyline(cl, color=(1.0, 0.0, 0.0))
 
-        # label "<number> cm"
-        digit_scale = LABEL_SCALE * r_raw
-        num_text = f"{d_cm:.1f}"
-        num_ls, end_x = make_7seg_string(num_text, s=digit_scale, color=LABEL_COLOR)
+    # Compute length in cm (arc length)
+    L_cm = float(s[-1] * UNIT_SCALE_TO_CM)
 
-        gap = LETTER_GAP_MULT * digit_scale * 1.2
-        cm_ls, _ = make_stroke_word("cm", start_x=end_x + gap,
-                                    s=digit_scale * LETTER_SCALE_MULT, color=LABEL_COLOR)
+    # Average diameter in cm (mid portion)
+    dcm = np.array([r[2] for r in rows], float)
+    dcm = dcm[np.isfinite(dcm)]
+    if len(dcm) > 0:
+        if AVG_MODE == "mid":
+            lo = int(np.floor(MID_FRAC_LOW * len(dcm)))
+            hi = int(np.ceil(MID_FRAC_HIGH * len(dcm)))
+            mid = dcm[lo:hi] if hi > lo else dcm
+            avg_d_cm = float(np.mean(mid))
+        else:
+            avg_d_cm = float(np.mean(dcm))
+    else:
+        avg_d_cm = float("nan")
 
-        label_local = merge_linesets([num_ls, cm_ls])
+    print("\n=== SUMMARY ===")
+    print(f"Curved length (cm): {L_cm:.2f}")
+    print(f"Avg diameter (cm): {avg_d_cm:.2f}")
 
-        out_dir = u_ring
-        u_text, v_text = build_label_basis(out_dir, WORLD_UP)
-        label_origin = c3 + (r_raw * LABEL_OFFSET) * out_dir
-        labels.append(place_label_lineset(label_local, label_origin, u_text, v_text))
-
-        print(f"Ring {i:02d} @ {pos01*100:5.1f}%  D = {d_cm:6.2f} cm  (slice n={n_in})")
-
-    # ---- Added: compute average diameter, volume, surface area ----
-    d_list = [r[3] for r in rows if (len(r) > 3 and isinstance(r[3], (float, np.floating)) and not np.isnan(r[3]))]
-    avg_d_cm = float(np.mean(d_list)) if len(d_list) else float("nan")
-
-    vol_cm3 = float("nan")
-    area_cm2 = float("nan")
-    if len(ring_r_cm) >= 2:
-        ring_t_cm = np.array(ring_t_cm, dtype=float)
-        ring_r_cm = np.array(ring_r_cm, dtype=float)
-        idx = np.argsort(ring_t_cm)
-        ring_t_cm = ring_t_cm[idx]
-        ring_r_cm = ring_r_cm[idx]
-
-        v = 0.0
-        a = 0.0
-        for k in range(len(ring_r_cm) - 1):
-            h = float(ring_t_cm[k + 1] - ring_t_cm[k])
-            r1 = float(ring_r_cm[k])
-            r2 = float(ring_r_cm[k + 1])
-            v += frustum_volume_cm3(r1, r2, h)
-            a += frustum_lateral_area_cm2(r1, r2, h)
-        vol_cm3 = v
-        area_cm2 = a
-
-    print("\n=== SUMMARY (computed from rings) ===")
-    print(f"Average diameter = {avg_d_cm:.2f} cm")
-    print(f"Approx volume    = {vol_cm3:.1f} cm3")
-    print(f"Approx area      = {area_cm2:.1f} cm2  (lateral only)\n")
-
-    # ---- Length label in 3D (better positioned using first ring outward direction) ----
-    if SHOW_LENGTH_LABEL:
-        if first_out_dir is None:
-            first_out_dir = np.array([1.0, 0.0, 0.0])
-
-        # Build local "L= <number> cm"
-        l_scale = max(L_LABEL_SCALE_FRAC_OF_LENGTH * L_raw, 1e-6)
-
-        prefix_ls, x_end = make_stroke_word("L=", start_x=0.0, s=l_scale, color=LABEL_COLOR)
-
-        num_ls, x_num_end = make_7seg_string(f"{L_cm:.1f}", s=l_scale, color=LABEL_COLOR)
-        num_pts = np.asarray(num_ls.points).copy()
-        num_pts[:, 0] += x_end + (0.4 * l_scale)
-        num_ls.points = o3d.utility.Vector3dVector(num_pts)
-
-        cm_ls, _ = make_stroke_word("cm", start_x=(x_end + 0.4 * l_scale) + x_num_end + (0.4 * l_scale),
-                                    s=l_scale, color=LABEL_COLOR)
-
-        L_label_local = merge_linesets([prefix_ls, num_ls, cm_ls])
-
-        # Place near top end (p1) slightly inside along axis and pushed outward
-        out_dir = first_out_dir / np.linalg.norm(first_out_dir)
-        uL, vL = build_label_basis(out_dir, WORLD_UP)
-
-        origin = (p1 - (L_LABEL_ALONG_AXIS * L_raw) * axis) + (L_LABEL_OUTWARD * L_raw) * out_dir
-        labels.append(place_label_lineset(L_label_local, origin, uL, vL))
-
-    # save csv (now includes diameter, radius, axial position)
-    df = pd.DataFrame(
-        rows,
-        columns=["ring_id", "pos_0to1", "pos_percent", "diameter_cm", "radius_cm", "t_cm_from_start", "slice_points"]
-    )
     if SAVE_CSV:
-        out_csv = os.path.splitext(IN_PATH)[0] + "_ring_values_cm.csv"
+        df = pd.DataFrame(rows, columns=["ring_id", "s_along_centerline", "diameter_cm", "radius_cm", "slice_points"])
+        base = os.path.splitext(IN_PATH)[0]
+        out_csv = base + "_ring_values_cm.csv"
         df.to_csv(out_csv, index=False)
-        print(f"Saved CSV: {out_csv}")
+        print(f"Saved: {out_csv}")
 
-        # also save a small summary csv (optional, same folder)
-        summary_csv = os.path.splitext(IN_PATH)[0] + "_summary_cm.csv"
-        pd.DataFrame([{
-            "length_cm": L_cm,
-            "avg_diameter_cm": avg_d_cm,
-            "approx_volume_cm3": vol_cm3,
-            "approx_area_cm2": area_cm2
-        }]).to_csv(summary_csv, index=False)
-        print(f"Saved summary CSV: {summary_csv}")
-
-    geoms = [pcd, axis_ls] + rings + labels
+    # Visualize
+    geoms = [pcd, length_line] + ring_geoms
     vis = o3d.visualization.Visualizer()
-    vis.create_window("Cob diameters + LENGTH (cm) in 3D", 1280, 720)
+    vis.create_window("Cob rings (curved centerline)", 1280, 720)
     for g in geoms:
         vis.add_geometry(g)
+
     opt = vis.get_render_option()
     opt.point_size = float(POINT_SIZE)
-    opt.background_color = np.array([0.05, 0.05, 0.05])
+    opt.background_color = BACKGROUND
     vis.run()
     vis.destroy_window()
 
