@@ -7,50 +7,66 @@ import matplotlib.pyplot as plt
 # =======================
 # CONFIG
 # =======================
-IN_PATH = "presentation.ply"
+IN_PATH = "ada85s2main.ply"
 
-# IMPORTANT: set correctly for your PLY units
-# dm->cm = 10, m->cm = 100
-UNIT_SCALE_TO_CM = 10.0
+# raw-unit -> cm
+UNIT_SCALE_TO_CM = 5.63
 
-# Rings
+# Manual reference values for this sample
+MANUAL_LENGTH_CM = 17.0
+MANUAL_BOTTOM_RING_CM = 14.0
+MANUAL_MIDDLE_RING_CM = 13.5
+MANUAL_TOP_RING_CM = 10.0
+
+# Rings along cob
 N_RINGS = 55
-SLICE_THICKNESS_FRAC = 0.012  # thickness for picking points around each ring (coarse-axis slab)
+
+# Thin-band slice used for original ring profile
+SLICE_THICKNESS_FRAC = 0.012
+
+# Manual-style tape band thickness
+MANUAL_RING_THICKNESS_CM = 1.0
 
 # Outlier removal
 REMOVE_OUTLIERS = True
 OUTLIER_NB_NEIGHBORS = 30
 OUTLIER_STD_RATIO = 2.5
 
-# Body detection (rough, along coarse PCA axis)
+# Body detection
 PROFILE_SAMPLES = 240
 PROFILE_SLICE_FRAC = 0.010
 PROFILE_SMOOTH_WIN = 11
-BODY_THRESH_FRAC = 0.18
+BODY_THRESH_FRAC = 0.28
 BODY_GAP_FILL = 5
 
-# Skip end region for rings/metrics (tips are messy)
+# Skip messy ends
 SKIP_END_FRAC = 0.03
 
-# Outer radius method (prevents rings going inside)
+# Ring label positions
+BOTTOM_POS_FRAC = 0.15
+MIDDLE_POS_FRAC = 0.50
+TOP_POS_FRAC = 0.85
+
+# Outer radius method
 ANGLE_BINS = 240
-RADIAL_CAP_Q = 0.995        # remove extreme outliers before max
-OUTER_SMOOTH_WIN = 5        # smooth ring radii along arc-length (odd 3/5/7). 0 disables.
+RADIAL_CAP_Q = 0.995
+BIN_RADIUS_Q = 0.94
+OUTER_SMOOTH_WIN = 7
 
-# Ring thickness (visible)
-RING_TUBE_FRAC = 0.018      # tube radius = frac * ring_radius
+# Ring thickness (visualization)
+RING_TUBE_FRAC = 0.018
 
-# Curved centerline extraction (robust)
-CENTERLINE_SAMPLES = 140
+# Curved centerline extraction
+CENTERLINE_SAMPLES = 90
 CENTERLINE_SLICE_FRAC = 0.010
-CENTERLINE_SMOOTH_WIN = 9
+CENTERLINE_SMOOTH_WIN = 15
 
 # Length stabilization
-CENTERLINE_RESAMPLE_N = 240      # uniform arclength samples for stable length
-CENTERLINE_LENGTH_SMOOTH_WIN = 7 # light smoothing after resample (odd)
+CENTERLINE_RESAMPLE_N = 160
+CENTERLINE_LENGTH_SMOOTH_WIN = 11
 
-# Diameter stats region (if you want "mid" only)
-AVG_MODE = "all"  # "all" or "mid"
+# Diameter stats region
+AVG_MODE = "all"   # "all" or "mid"
 MID_FRAC_LOW = 0.10
 MID_FRAC_HIGH = 0.90
 
@@ -62,7 +78,6 @@ SHOW_OPEN3D = True
 
 # Save outputs
 SAVE_CSV = True
-# =======================
 
 
 # -------------------------
@@ -131,6 +146,17 @@ def largest_true_segment(mask):
     return best[0], best[1]
 
 
+def pct_error(pred, true):
+    if not np.isfinite(pred) or not np.isfinite(true) or abs(true) < 1e-12:
+        return np.nan
+    return 100.0 * (pred - true) / true
+
+
+def abs_pct_error(pred, true):
+    pe = pct_error(pred, true)
+    return np.abs(pe) if np.isfinite(pe) else np.nan
+
+
 # -------------------------
 # PCA axis & slicing helpers
 # -------------------------
@@ -154,13 +180,14 @@ def plane_basis(normal):
     tmp = np.array([1.0, 0.0, 0.0])
     if abs(np.dot(tmp, normal)) > 0.9:
         tmp = np.array([0.0, 1.0, 0.0])
-    u = np.cross(normal, tmp); u /= np.linalg.norm(u)
+    u = np.cross(normal, tmp)
+    u /= np.linalg.norm(u)
     v = np.cross(normal, u)
     return u, v
 
 
 # -------------------------
-# Body interval detection (coarse, along PCA axis)
+# Body interval detection
 # -------------------------
 def radius_quantile(points_slice, center, axis, q=0.90):
     axis = axis / np.linalg.norm(axis)
@@ -195,17 +222,17 @@ def detect_body_interval(pts, center, axis, t_full_min, t_full_max):
 
     valid = np.isfinite(radii)
     if valid.sum() < 10:
-        return np.quantile(ts, 0.02), np.quantile(ts, 0.98)
+        return np.quantile(ts, 0.05), np.quantile(ts, 0.95)
 
     rid = radii.copy()
-    # forward fill
+
     last = None
     for i in range(len(rid)):
         if np.isfinite(rid[i]):
             last = rid[i]
         elif last is not None:
             rid[i] = last
-    # back fill
+
     last = None
     for i in range(len(rid) - 1, -1, -1):
         if np.isfinite(rid[i]):
@@ -222,13 +249,13 @@ def detect_body_interval(pts, center, axis, t_full_min, t_full_max):
 
     s, e = largest_true_segment(body)
     if s is None:
-        return np.quantile(ts, 0.02), np.quantile(ts, 0.98)
+        return np.quantile(ts, 0.05), np.quantile(ts, 0.95)
 
     return float(ts[s]), float(ts[e - 1])
 
 
 # -------------------------
-# Robust curved centerline (trimmed centroid per slab)
+# Curved centerline
 # -------------------------
 def build_centerline(pts, center, axis, t_body_min, t_body_max):
     L_body = t_body_max - t_body_min
@@ -250,18 +277,24 @@ def build_centerline(pts, center, axis, t_body_min, t_body_max):
         y = rel @ v_ax
         r = np.sqrt(x * x + y * y)
 
-        # Trim radial outliers (background, stray points)
         rcap = np.quantile(r, 0.98)
         keep = r <= rcap
         slab = slab[keep]
         if len(slab) < 180:
             continue
 
-        cl.append(slab.mean(axis=0))
+        c = slab.mean(axis=0)
+        d = np.linalg.norm(slab - c, axis=1)
+        keep2 = d <= np.quantile(d, 0.90)
+        slab2 = slab[keep2]
+
+        if len(slab2) < 50:
+            continue
+
+        cl.append(slab2.mean(axis=0))
 
     cl = np.array(cl, float)
     if len(cl) < 10:
-        # fallback straight
         return np.vstack([center + t_body_min * axis, center + t_body_max * axis])
 
     cl = moving_average_vec(cl, CENTERLINE_SMOOTH_WIN)
@@ -314,15 +347,32 @@ def tangent_from_centerline(cl, i):
 
 
 # -------------------------
-# Outer radius in local ring plane (prevents inside rings)
+# Ring radius helpers
 # -------------------------
-def outer_radius_angle_binned(points_slice, plane_center, normal, bins=240, cap_q=0.995):
+def robust_slice_center_xy(x, y):
+    cx = np.median(x)
+    cy = np.median(y)
+    d = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    keep = d <= np.quantile(d, 0.90)
+    if np.sum(keep) < 20:
+        return float(cx), float(cy)
+    return float(np.mean(x[keep])), float(np.mean(y[keep]))
+
+
+def outer_radius_angle_binned(points_slice, plane_center, normal, bins=240, cap_q=0.995, bin_q=0.94):
     u, v = plane_basis(normal)
+
     rel = points_slice - plane_center
-    x = rel @ u
-    y = rel @ v
+    x0 = rel @ u
+    y0 = rel @ v
+
+    cx, cy = robust_slice_center_xy(x0, y0)
+    x = x0 - cx
+    y = y0 - cy
+
     ang = np.arctan2(y, x)
     r = np.sqrt(x * x + y * y)
+
     if len(r) < 80:
         return np.nan
 
@@ -332,16 +382,32 @@ def outer_radius_angle_binned(points_slice, plane_center, normal, bins=240, cap_
     r = r[keep]
 
     edges = np.linspace(-np.pi, np.pi, bins + 1)
-    rmax_bins = []
+    vals = []
     for i in range(bins):
         m = (ang >= edges[i]) & (ang < edges[i + 1])
         if np.any(m):
-            rmax_bins.append(np.max(r[m]))
+            vals.append(np.quantile(r[m], bin_q))
 
-    if len(rmax_bins) < max(20, bins * 0.15):
-        return float(np.quantile(r, 0.97))
+    if len(vals) < max(20, bins * 0.15):
+        return float(np.quantile(r, bin_q))
 
-    return float(np.median(np.array(rmax_bins)))
+    return float(np.median(np.array(vals)))
+
+
+def circumference_from_band(points_band, plane_center, normal):
+    r = outer_radius_angle_binned(
+        points_band,
+        plane_center=plane_center,
+        normal=normal,
+        bins=ANGLE_BINS,
+        cap_q=RADIAL_CAP_Q,
+        bin_q=BIN_RADIUS_Q
+    )
+    if not np.isfinite(r):
+        return np.nan, np.nan
+    diameter_cm = 2.0 * r * UNIT_SCALE_TO_CM
+    circumference_cm = 2.0 * np.pi * r * UNIT_SCALE_TO_CM
+    return diameter_cm, circumference_cm
 
 
 # -------------------------
@@ -388,7 +454,7 @@ def make_polyline(points, color=(1, 0, 0)):
 
 
 # -------------------------
-# Metrics (area, volume) along arc-length profile
+# Metrics
 # -------------------------
 def compute_area_volume_from_profile(s_ring, r_ring):
     s_ring = np.asarray(s_ring, float)
@@ -402,20 +468,16 @@ def compute_area_volume_from_profile(s_ring, r_ring):
 
     ds = np.diff(s)
     r_avg = 0.5 * (r[:-1] + r[1:])
-
-    # Lateral surface area (approx): ∫ 2πr ds
     area = np.sum(2.0 * np.pi * r_avg * ds)
-
-    # Volume (approx): ∫ π r^2 ds
     vol = np.sum(np.pi * (r_avg ** 2) * ds)
     return float(area), float(vol)
 
 
-# -------------------------
-# Matplotlib equal-aspect helper
-# -------------------------
 def set_axes_equal_3d(ax, X, Y, Z, pad=0.10):
-    X = np.asarray(X); Y = np.asarray(Y); Z = np.asarray(Z)
+    X = np.asarray(X)
+    Y = np.asarray(Y)
+    Z = np.asarray(Z)
+
     x_min, x_max = float(np.min(X)), float(np.max(X))
     y_min, y_max = float(np.min(Y)), float(np.max(Y))
     z_min, z_max = float(np.min(Z)), float(np.max(Z))
@@ -429,13 +491,18 @@ def set_axes_equal_3d(ax, X, Y, Z, pad=0.10):
     y_mid = (y_max + y_min) / 2.0
     z_mid = (z_max + z_min) / 2.0
 
-    ax.set_xlim(x_mid - max_rng/2, x_mid + max_rng/2)
-    ax.set_ylim(y_mid - max_rng/2, y_mid + max_rng/2)
-    ax.set_zlim(z_mid - max_rng/2, z_mid + max_rng/2)
+    ax.set_xlim(x_mid - max_rng / 2, x_mid + max_rng / 2)
+    ax.set_ylim(y_mid - max_rng / 2, y_mid + max_rng / 2)
+    ax.set_zlim(z_mid - max_rng / 2, z_mid + max_rng / 2)
     try:
         ax.set_box_aspect((1, 1, 1))
     except Exception:
         pass
+
+
+def pick_ring_index_by_fraction(valid_idx, frac, total_n):
+    target = frac * (total_n - 1)
+    return valid_idx[np.argmin(np.abs(valid_idx.astype(float) - target))]
 
 
 # =======================
@@ -454,28 +521,24 @@ def main():
 
     pts = np.asarray(pcd.points)
 
-    # Coarse axis to order slices
     center, coarse_axis = pca_axis(pts)
     t_all = (pts - center) @ coarse_axis
     t_full_min = float(np.quantile(t_all, 0.001))
     t_full_max = float(np.quantile(t_all, 0.999))
 
-    # Body interval (coarse)
     t_body_min, t_body_max = detect_body_interval(pts, center, coarse_axis, t_full_min, t_full_max)
     L_body = t_body_max - t_body_min
 
-    # Robust centerline, then stabilize for length
     cl_raw = build_centerline(pts, center, coarse_axis, t_body_min, t_body_max)
-    cl = smooth_centerline_for_length(cl_raw)  # stable length + stable tangents
+    cl = smooth_centerline_for_length(cl_raw)
     s_cl = centerline_arclength(cl)
 
-    # Lengths
     L_curved_raw = float(s_cl[-1])
     L_curved_cm = L_curved_raw * UNIT_SCALE_TO_CM
+
     L_straight_raw = float(np.linalg.norm(cl[-1] - cl[0]))
     L_straight_cm = L_straight_raw * UNIT_SCALE_TO_CM
 
-    # Ring positions along centerline arc length (skip ends)
     s0 = s_cl[0] + SKIP_END_FRAC * (s_cl[-1] - s_cl[0])
     s1 = s_cl[-1] - SKIP_END_FRAC * (s_cl[-1] - s_cl[0])
     ring_s = np.linspace(s0, s1, N_RINGS)
@@ -483,18 +546,18 @@ def main():
     ring_centers, idxs, _ = sample_centerline_by_arclength(cl, s_cl, ring_s)
     ring_normals = np.array([tangent_from_centerline(cl, int(i)) for i in idxs])
 
-    # Select slice points around each ring using coarse-axis slabs (fast)
-    half_thick = 0.5 * (SLICE_THICKNESS_FRAC * L_body)
+    # thin-band ring profile
+    half_thick_thin = 0.5 * (SLICE_THICKNESS_FRAC * L_body)
     t_pts = (pts - center) @ coarse_axis
     t_ring = (ring_centers - center) @ coarse_axis
 
     ring_radii = np.full(N_RINGS, np.nan, float)
-    slice_counts = np.zeros(N_RINGS, int)
+    slice_counts_thin = np.zeros(N_RINGS, int)
 
     for i in range(N_RINGS):
-        m = (t_pts >= (t_ring[i] - half_thick)) & (t_pts <= (t_ring[i] + half_thick))
+        m = (t_pts >= (t_ring[i] - half_thick_thin)) & (t_pts <= (t_ring[i] + half_thick_thin))
         n_in = int(m.sum())
-        slice_counts[i] = n_in
+        slice_counts_thin[i] = n_in
         if n_in < 250:
             continue
 
@@ -503,10 +566,10 @@ def main():
             plane_center=ring_centers[i],
             normal=ring_normals[i],
             bins=ANGLE_BINS,
-            cap_q=RADIAL_CAP_Q
+            cap_q=RADIAL_CAP_Q,
+            bin_q=BIN_RADIUS_Q
         )
 
-    # Smooth radii to remove local dips/spikes
     valid = np.isfinite(ring_radii)
     if OUTER_SMOOTH_WIN > 1 and valid.sum() >= OUTER_SMOOTH_WIN:
         rr = ring_radii.copy()
@@ -515,63 +578,261 @@ def main():
         rr = moving_average_1d(rr, OUTER_SMOOTH_WIN)
         ring_radii[valid] = rr[valid]
 
-    # Width stats
-    widths_cm = 2.0 * ring_radii * UNIT_SCALE_TO_CM
-    valid_w = np.isfinite(widths_cm)
+    diameters_cm = 2.0 * ring_radii * UNIT_SCALE_TO_CM
+    circumferences_cm = 2.0 * np.pi * ring_radii * UNIT_SCALE_TO_CM
 
+    valid_w = np.isfinite(diameters_cm)
     if valid_w.any():
         if AVG_MODE.lower() == "mid":
-            wv = widths_cm[valid_w]
+            wv = diameters_cm[valid_w]
             lo = int(np.floor(MID_FRAC_LOW * len(wv)))
             hi = int(np.ceil(MID_FRAC_HIGH * len(wv)))
             w_use = wv[lo:hi] if hi > lo else wv
         else:
-            w_use = widths_cm[valid_w]
+            w_use = diameters_cm[valid_w]
+
         avg_width_cm = float(np.mean(w_use))
-        max_width_cm = float(np.max(widths_cm[valid_w]))
-        min_width_cm = float(np.min(widths_cm[valid_w]))
+        max_width_cm = float(np.max(diameters_cm[valid_w]))
+        min_width_cm = float(np.min(diameters_cm[valid_w]))
     else:
         avg_width_cm = max_width_cm = min_width_cm = float("nan")
 
-    # Area / volume (raw -> cm²/cm³)
     area_raw, vol_raw = compute_area_volume_from_profile(ring_s, ring_radii)
     area_cm2 = area_raw * (UNIT_SCALE_TO_CM ** 2) if np.isfinite(area_raw) else float("nan")
     vol_cm3 = vol_raw * (UNIT_SCALE_TO_CM ** 3) if np.isfinite(vol_raw) else float("nan")
 
-    # Summary table
+    # select named ring positions from thin-band valid rings
+    valid_idx = np.where(np.isfinite(circumferences_cm))[0]
+    if len(valid_idx) > 0:
+        i_a = pick_ring_index_by_fraction(valid_idx, BOTTOM_POS_FRAC, len(circumferences_cm))
+        i_m = pick_ring_index_by_fraction(valid_idx, MIDDLE_POS_FRAC, len(circumferences_cm))
+        i_b = pick_ring_index_by_fraction(valid_idx, TOP_POS_FRAC, len(circumferences_cm))
+
+        if diameters_cm[i_a] >= diameters_cm[i_b]:
+            i_bottom = i_a
+            i_top = i_b
+        else:
+            i_bottom = i_b
+            i_top = i_a
+
+        i_middle = i_m
+    else:
+        i_bottom = i_middle = i_top = -1
+
+    # thin-band named outputs
+    if i_bottom >= 0:
+        bottom_circ_cm = float(circumferences_cm[i_bottom])
+        middle_circ_cm = float(circumferences_cm[i_middle])
+        top_circ_cm = float(circumferences_cm[i_top])
+
+        bottom_diam_cm = float(diameters_cm[i_bottom])
+        middle_diam_cm = float(diameters_cm[i_middle])
+        top_diam_cm = float(diameters_cm[i_top])
+    else:
+        bottom_circ_cm = middle_circ_cm = top_circ_cm = float("nan")
+        bottom_diam_cm = middle_diam_cm = top_diam_cm = float("nan")
+
+    # 1 cm manual-style band outputs
+    manual_half_thick_raw = 0.5 * (MANUAL_RING_THICKNESS_CM / UNIT_SCALE_TO_CM)
+
+    def manual_band_measure(i_ring):
+        if i_ring < 0:
+            return np.nan, np.nan, 0
+        m = (t_pts >= (t_ring[i_ring] - manual_half_thick_raw)) & (t_pts <= (t_ring[i_ring] + manual_half_thick_raw))
+        n_in = int(m.sum())
+        if n_in < 250:
+            return np.nan, np.nan, n_in
+        dcm, ccm = circumference_from_band(
+            pts[m],
+            plane_center=ring_centers[i_ring],
+            normal=ring_normals[i_ring]
+        )
+        return dcm, ccm, n_in
+
+    bottom_diam_cm_1cm, bottom_circ_cm_1cm, bottom_pts_1cm = manual_band_measure(i_bottom)
+    middle_diam_cm_1cm, middle_circ_cm_1cm, middle_pts_1cm = manual_band_measure(i_middle)
+    top_diam_cm_1cm, top_circ_cm_1cm, top_pts_1cm = manual_band_measure(i_top)
+
+    # errors
+    length_err_pct = pct_error(L_curved_cm, MANUAL_LENGTH_CM)
+    length_abs_err_pct = abs_pct_error(L_curved_cm, MANUAL_LENGTH_CM)
+
+    bottom_err_pct_thin = pct_error(bottom_circ_cm, MANUAL_BOTTOM_RING_CM)
+    middle_err_pct_thin = pct_error(middle_circ_cm, MANUAL_MIDDLE_RING_CM)
+    top_err_pct_thin = pct_error(top_circ_cm, MANUAL_TOP_RING_CM)
+
+    bottom_abs_err_pct_thin = abs_pct_error(bottom_circ_cm, MANUAL_BOTTOM_RING_CM)
+    middle_abs_err_pct_thin = abs_pct_error(middle_circ_cm, MANUAL_MIDDLE_RING_CM)
+    top_abs_err_pct_thin = abs_pct_error(top_circ_cm, MANUAL_TOP_RING_CM)
+
+    bottom_err_pct_1cm = pct_error(bottom_circ_cm_1cm, MANUAL_BOTTOM_RING_CM)
+    middle_err_pct_1cm = pct_error(middle_circ_cm_1cm, MANUAL_MIDDLE_RING_CM)
+    top_err_pct_1cm = pct_error(top_circ_cm_1cm, MANUAL_TOP_RING_CM)
+
+    bottom_abs_err_pct_1cm = abs_pct_error(bottom_circ_cm_1cm, MANUAL_BOTTOM_RING_CM)
+    middle_abs_err_pct_1cm = abs_pct_error(middle_circ_cm_1cm, MANUAL_MIDDLE_RING_CM)
+    top_abs_err_pct_1cm = abs_pct_error(top_circ_cm_1cm, MANUAL_TOP_RING_CM)
+
+    ring_mape_thin = np.nanmean([bottom_abs_err_pct_thin, middle_abs_err_pct_thin, top_abs_err_pct_thin])
+    ring_mape_1cm = np.nanmean([bottom_abs_err_pct_1cm, middle_abs_err_pct_1cm, top_abs_err_pct_1cm])
+    overall_mape_thin = np.nanmean([length_abs_err_pct, bottom_abs_err_pct_thin, middle_abs_err_pct_thin, top_abs_err_pct_thin])
+    overall_mape_1cm = np.nanmean([length_abs_err_pct, bottom_abs_err_pct_1cm, middle_abs_err_pct_1cm, top_abs_err_pct_1cm])
+
     summary = pd.DataFrame([{
         "straight_length_cm": L_straight_cm,
         "curved_length_cm": L_curved_cm,
         "surface_area_cm2": area_cm2,
         "volume_cm3": vol_cm3,
-        "avg_width_cm": avg_width_cm,
-        "max_width_cm": max_width_cm,
-        "min_width_cm": min_width_cm,
+
+        "avg_diameter_cm_thin": avg_width_cm,
+        "max_diameter_cm_thin": max_width_cm,
+        "min_diameter_cm_thin": min_width_cm,
+
+        "bottom_circumference_cm_thin": bottom_circ_cm,
+        "middle_circumference_cm_thin": middle_circ_cm,
+        "top_circumference_cm_thin": top_circ_cm,
+
+        "bottom_diameter_cm_thin": bottom_diam_cm,
+        "middle_diameter_cm_thin": middle_diam_cm,
+        "top_diameter_cm_thin": top_diam_cm,
+
+        "bottom_circumference_cm_1cm": bottom_circ_cm_1cm,
+        "middle_circumference_cm_1cm": middle_circ_cm_1cm,
+        "top_circumference_cm_1cm": top_circ_cm_1cm,
+
+        "bottom_diameter_cm_1cm": bottom_diam_cm_1cm,
+        "middle_diameter_cm_1cm": middle_diam_cm_1cm,
+        "top_diameter_cm_1cm": top_diam_cm_1cm,
+
+        "manual_length_cm": MANUAL_LENGTH_CM,
+        "manual_bottom_ring_cm": MANUAL_BOTTOM_RING_CM,
+        "manual_middle_ring_cm": MANUAL_MIDDLE_RING_CM,
+        "manual_top_ring_cm": MANUAL_TOP_RING_CM,
+
+        "length_error_pct": length_err_pct,
+        "length_abs_error_pct": length_abs_err_pct,
+
+        "bottom_error_pct_thin": bottom_err_pct_thin,
+        "middle_error_pct_thin": middle_err_pct_thin,
+        "top_error_pct_thin": top_err_pct_thin,
+
+        "bottom_abs_error_pct_thin": bottom_abs_err_pct_thin,
+        "middle_abs_error_pct_thin": middle_abs_err_pct_thin,
+        "top_abs_error_pct_thin": top_abs_err_pct_thin,
+
+        "bottom_error_pct_1cm": bottom_err_pct_1cm,
+        "middle_error_pct_1cm": middle_err_pct_1cm,
+        "top_error_pct_1cm": top_err_pct_1cm,
+
+        "bottom_abs_error_pct_1cm": bottom_abs_err_pct_1cm,
+        "middle_abs_error_pct_1cm": middle_abs_err_pct_1cm,
+        "top_abs_error_pct_1cm": top_abs_err_pct_1cm,
+
+        "ring_mape_thin": ring_mape_thin,
+        "ring_mape_1cm": ring_mape_1cm,
+        "overall_mape_thin": overall_mape_thin,
+        "overall_mape_1cm": overall_mape_1cm,
+
+        "bottom_ring_id": int(i_bottom + 1) if i_bottom >= 0 else np.nan,
+        "middle_ring_id": int(i_middle + 1) if i_middle >= 0 else np.nan,
+        "top_ring_id": int(i_top + 1) if i_top >= 0 else np.nan,
+
+        "bottom_band_points_1cm": bottom_pts_1cm,
+        "middle_band_points_1cm": middle_pts_1cm,
+        "top_band_points_1cm": top_pts_1cm,
+
         "rings_total": int(N_RINGS),
         "rings_valid": int(np.isfinite(ring_radii).sum()),
         "unit_scale_to_cm": UNIT_SCALE_TO_CM,
+        "manual_ring_thickness_cm": MANUAL_RING_THICKNESS_CM,
     }])
+
+    comparison_rows = [
+        {
+            "trait": "length",
+            "manual_cm": MANUAL_LENGTH_CM,
+            "thin_band_cm": np.nan,
+            "band_1cm_cm": L_curved_cm,
+            "thin_error_pct": np.nan,
+            "band_1cm_error_pct": length_err_pct,
+            "thin_abs_error_pct": np.nan,
+            "band_1cm_abs_error_pct": length_abs_err_pct,
+        },
+        {
+            "trait": "bottom_ring",
+            "manual_cm": MANUAL_BOTTOM_RING_CM,
+            "thin_band_cm": bottom_circ_cm,
+            "band_1cm_cm": bottom_circ_cm_1cm,
+            "thin_error_pct": bottom_err_pct_thin,
+            "band_1cm_error_pct": bottom_err_pct_1cm,
+            "thin_abs_error_pct": bottom_abs_err_pct_thin,
+            "band_1cm_abs_error_pct": bottom_abs_err_pct_1cm,
+        },
+        {
+            "trait": "middle_ring",
+            "manual_cm": MANUAL_MIDDLE_RING_CM,
+            "thin_band_cm": middle_circ_cm,
+            "band_1cm_cm": middle_circ_cm_1cm,
+            "thin_error_pct": middle_err_pct_thin,
+            "band_1cm_error_pct": middle_err_pct_1cm,
+            "thin_abs_error_pct": middle_abs_err_pct_thin,
+            "band_1cm_abs_error_pct": middle_abs_err_pct_1cm,
+        },
+        {
+            "trait": "top_ring",
+            "manual_cm": MANUAL_TOP_RING_CM,
+            "thin_band_cm": top_circ_cm,
+            "band_1cm_cm": top_circ_cm_1cm,
+            "thin_error_pct": top_err_pct_thin,
+            "band_1cm_error_pct": top_err_pct_1cm,
+            "thin_abs_error_pct": top_abs_err_pct_thin,
+            "band_1cm_abs_error_pct": top_abs_err_pct_1cm,
+        },
+    ]
+    comparison_df = pd.DataFrame(comparison_rows)
 
     print("\n=== SUMMARY TABLE ===")
     print(summary.to_string(index=False))
 
-    # Save outputs
+    print("\n=== MANUAL COMPARISON GUIDE ===")
+    print(f"Cob length: {L_curved_cm:.2f} cm")
+    print("\nThin-band ring circumferences:")
+    print(f"  Bottom: {bottom_circ_cm:.2f} cm")
+    print(f"  Middle: {middle_circ_cm:.2f} cm")
+    print(f"  Top   : {top_circ_cm:.2f} cm")
+    print("\n1 cm band ring circumferences:")
+    print(f"  Bottom: {bottom_circ_cm_1cm:.2f} cm")
+    print(f"  Middle: {middle_circ_cm_1cm:.2f} cm")
+    print(f"  Top   : {top_circ_cm_1cm:.2f} cm")
+
+    print("\n=== ERROR SUMMARY ===")
+    print(f"Length abs error: {length_abs_err_pct:.2f}%")
+    print(f"Thin-band ring MAPE: {ring_mape_thin:.2f}%")
+    print(f"1 cm band ring MAPE: {ring_mape_1cm:.2f}%")
+    print(f"Overall MAPE (thin): {overall_mape_thin:.2f}%")
+    print(f"Overall MAPE (1 cm): {overall_mape_1cm:.2f}%")
+
     if SAVE_CSV:
         base = os.path.splitext(IN_PATH)[0]
+
         rings_df = pd.DataFrame({
             "ring_id": np.arange(1, N_RINGS + 1),
             "s_along_centerline_raw": ring_s,
-            "radius_raw": ring_radii,
-            "radius_cm": ring_radii * UNIT_SCALE_TO_CM,
-            "width_cm": widths_cm,
-            "slice_points": slice_counts
+            "radius_raw_thin": ring_radii,
+            "radius_cm_thin": ring_radii * UNIT_SCALE_TO_CM,
+            "diameter_cm_thin": diameters_cm,
+            "circumference_cm_thin": circumferences_cm,
+            "slice_points_thin": slice_counts_thin
         })
+
         rings_df.to_csv(base + "_rings_profile.csv", index=False)
         summary.to_csv(base + "_summary_metrics.csv", index=False)
+        comparison_df.to_csv(base + "_manual_comparison.csv", index=False)
+
         print(f"\nSaved: {base + '_rings_profile.csv'}")
         print(f"Saved: {base + '_summary_metrics.csv'}")
+        print(f"Saved: {base + '_manual_comparison.csv'}")
 
-    # Matplotlib 3D (equal aspect)
     if SHOW_MATPLOTLIB_3D:
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
@@ -583,11 +844,12 @@ def main():
             ax.scatter(ring_centers[vm, 0], ring_centers[vm, 1], ring_centers[vm, 2], s=sizes)
 
         set_axes_equal_3d(ax, cl[:, 0], cl[:, 1], cl[:, 2], pad=0.10)
-        ax.set_title("Cob centerline + ring centers (equal aspect)")
-        ax.set_xlabel("X"); ax.set_ylabel("Y"); ax.set_zlabel("Z")
+        ax.set_title("Cob centerline + ring centers")
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
         plt.show()
 
-    # Open3D view
     if SHOW_OPEN3D:
         palette = [
             (0.0, 1.0, 0.0),
@@ -616,7 +878,7 @@ def main():
 
         geoms = [pcd, length_line] + ring_geoms
         vis = o3d.visualization.Visualizer()
-        vis.create_window("Cob rings (curved centerline)", 1280, 720)
+        vis.create_window("Cob rings (thin-band profile)", 1280, 720)
         for g in geoms:
             vis.add_geometry(g)
         opt = vis.get_render_option()
