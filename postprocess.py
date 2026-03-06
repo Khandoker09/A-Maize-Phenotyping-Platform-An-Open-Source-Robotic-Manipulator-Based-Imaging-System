@@ -4,7 +4,7 @@ Maize cob: clean (remove blue/white noise without deleting sparse side) + OPTION
 
 What this single script does (in order):
 
-1) Load your ASCII PCD (format like: FIELDS rgb nx ny nz x y z)
+1) Load your PCD safely with Open3D (ASCII or binary)
 2) STRICT but SAFE color filter:
    - remove very-white points
    - remove ONLY strong saturated blue/cyan points (won't eat cob)
@@ -20,7 +20,7 @@ What this single script does (in order):
    - optional resample mesh back into points (PLY)
 
 Install:
-    pip install open3d numpy pandas
+    pip install open3d numpy
 
 Run:
     python cob_all_in_one.py
@@ -30,14 +30,13 @@ Edit only the CONFIG section below.
 
 import os
 import numpy as np
-import pandas as pd
 import open3d as o3d
 
 
 # =========================
 # CONFIG (EDIT THESE)
 # =========================
-IN_PCD = r"cob85p.pcd"   # input ASCII PCD path
+IN_PCD = r"data\ada85s2 - Cloud.pcd"   # input PCD path (ASCII or binary)
 
 # outputs (auto named if None)
 OUT_CLEAN_PLY = None     # e.g. "cob_clean.ply"
@@ -98,23 +97,6 @@ HOLE_SIZE = 20000       # larger fills larger holes (in triangles count scale)
 # =========================
 # Helpers
 # =========================
-def pcd_ascii_header_lines(pcd_path: str) -> int:
-    n = 0
-    with open(pcd_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            n += 1
-            if line.strip().startswith("DATA"):
-                break
-    return n
-
-
-def unpack_rgb_uint32(rgb_uint32: np.ndarray):
-    r = ((rgb_uint32 >> 16) & 255).astype(np.uint8)
-    g = ((rgb_uint32 >> 8) & 255).astype(np.uint8)
-    b = (rgb_uint32 & 255).astype(np.uint8)
-    return r, g, b
-
-
 def rgb_to_hsv_np(rgb01: np.ndarray):
     """rgb01 in [0,1], returns hsv in [0,1]. Vectorized."""
     mx = rgb01.max(axis=1)
@@ -126,22 +108,27 @@ def rgb_to_hsv_np(rgb01: np.ndarray):
     v = mx.copy()
 
     nz = diff > 1e-12
-    s[nz] = diff[nz] / mx[nz]
+    s[nz] = diff[nz] / np.maximum(mx[nz], 1e-12)
 
     r, g, b = rgb01[:, 0], rgb01[:, 1], rgb01[:, 2]
+
     idx = nz & (mx == r)
     h[idx] = ((g[idx] - b[idx]) / diff[idx]) % 6
+
     idx = nz & (mx == g)
     h[idx] = ((b[idx] - r[idx]) / diff[idx]) + 2
+
     idx = nz & (mx == b)
     h[idx] = ((r[idx] - g[idx]) / diff[idx]) + 4
+
     h = (h / 6.0) % 1.0
     return np.stack([h, s, v], axis=1)
 
 
 def keep_top_k_clusters(pcd: o3d.geometry.PointCloud, eps: float, min_points: int, k_keep: int):
     labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=min_points, print_progress=True))
-    if labels.max() < 0:
+
+    if labels.size == 0 or labels.max() < 0:
         print("[DBSCAN] No clusters found. Keeping everything.")
         return pcd
 
@@ -149,6 +136,7 @@ def keep_top_k_clusters(pcd: o3d.geometry.PointCloud, eps: float, min_points: in
     counts = np.bincount(valid)
     top = np.argsort(counts)[::-1][:k_keep]
     mask = np.isin(labels, top)
+
     kept = pcd.select_by_index(np.where(mask)[0])
     print(f"[DBSCAN] Kept top {k_keep} clusters -> {len(kept.points):,} points")
     return kept
@@ -171,19 +159,27 @@ def main():
     out_mesh = OUT_MESH_PLY or mesh_default
     out_fill_pts = OUT_FILL_POINTS_PLY or pts_default
 
-    # 1) Load ASCII PCD (your style)
-    header = pcd_ascii_header_lines(IN_PCD)
-    cols = ["rgb", "nx", "ny", "nz", "x", "y", "z"]
-    df = pd.read_csv(IN_PCD, sep=r"\s+", skiprows=header, names=cols, engine="c")
-    print(f"[LOAD] Points: {len(df):,}")
+    # 1) Load PCD safely with Open3D
+    pcd_in = o3d.io.read_point_cloud(IN_PCD)
+    if pcd_in.is_empty():
+        raise ValueError(f"Failed to load point cloud or file is empty: {IN_PCD}")
 
-    rgb = df["rgb"].astype(np.uint32).to_numpy()
-    r, g, b = unpack_rgb_uint32(rgb)
-    xyz = df[["x", "y", "z"]].to_numpy(np.float64)
-    rgb01 = np.stack([r, g, b], axis=1).astype(np.float64) / 255.0
+    xyz = np.asarray(pcd_in.points, dtype=np.float64)
+    print(f"[LOAD] Points: {xyz.shape[0]:,}")
+
+    rgb01 = None
+    if pcd_in.has_colors():
+        rgb01 = np.asarray(pcd_in.colors, dtype=np.float64)
+        if len(rgb01) == len(xyz):
+            print("[LOAD] RGB colors detected.")
+        else:
+            print("[LOAD] Warning: colors length does not match points. Color filtering will be skipped.")
+            rgb01 = None
+    else:
+        print("[LOAD] No RGB colors detected. Color filtering will be skipped.")
 
     # 2) Safe color filter
-    if DO_COLOR_FILTER:
+    if DO_COLOR_FILTER and rgb01 is not None:
         hsv = rgb_to_hsv_np(rgb01)
 
         white = (hsv[:, 2] > WHITE_V_MIN) & (hsv[:, 1] < WHITE_S_MAX)
@@ -200,26 +196,37 @@ def main():
         rgb01 = rgb01[keep]
         print(f"[COLOR] After filter: {xyz.shape[0]:,}")
     else:
-        print("[COLOR] OFF")
+        print("[COLOR] OFF or no RGB colors available")
 
-    # Create Open3D cloud
+    # Create working Open3D cloud
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(xyz)
-    pcd.colors = o3d.utility.Vector3dVector(rgb01)
+    if rgb01 is not None:
+        pcd.colors = o3d.utility.Vector3dVector(rgb01)
 
     # 3) Gentle denoise (keeps sparse side)
     if DO_DENOISE:
-        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=SOR_NB_NEIGHBORS, std_ratio=SOR_STD_RATIO)
+        pcd, _ = pcd.remove_statistical_outlier(
+            nb_neighbors=SOR_NB_NEIGHBORS,
+            std_ratio=SOR_STD_RATIO
+        )
         print(f"[DENOISE] After SOR: {len(pcd.points):,}")
     else:
         print("[DENOISE] OFF")
 
     # 4) Optional: remove stand/fixture via clustering (top-K keep)
     if DO_DBSCAN_KEEP_TOPK:
-        pcd = keep_top_k_clusters(pcd, eps=DBSCAN_EPS, min_points=DBSCAN_MIN_POINTS, k_keep=DBSCAN_KEEP_TOP_K)
+        pcd = keep_top_k_clusters(
+            pcd,
+            eps=DBSCAN_EPS,
+            min_points=DBSCAN_MIN_POINTS,
+            k_keep=DBSCAN_KEEP_TOP_K
+        )
 
     # 5) Save cleaned point cloud
-    o3d.io.write_point_cloud(out_clean, pcd, write_ascii=True)
+    ok = o3d.io.write_point_cloud(out_clean, pcd, write_ascii=True)
+    if not ok:
+        raise IOError(f"Failed to save cleaned point cloud: {out_clean}")
     print(f"[SAVE] Clean cloud: {out_clean}")
 
     # Visualize cleaned
@@ -231,21 +238,33 @@ def main():
         print("[RECON] OFF. Done.")
         return
 
+    if len(pcd.points) == 0:
+        raise ValueError("Point cloud is empty before reconstruction.")
+
     # Normals
+    print("[RECON] Estimating normals...")
     pcd.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=NORMAL_RADIUS, max_nn=NORMAL_MAX_NN)
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=NORMAL_RADIUS,
+            max_nn=NORMAL_MAX_NN
+        )
     )
+
+    print("[RECON] Orienting normals...")
     pcd.orient_normals_consistent_tangent_plane(ORIENT_NORMALS_K)
 
     # Poisson reconstruction
     print("[RECON] Running Poisson reconstruction...")
-    mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=POISSON_DEPTH)
+    mesh, dens = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=POISSON_DEPTH
+    )
     dens = np.asarray(dens)
     print(f"[RECON] Triangles (raw): {np.asarray(mesh.triangles).shape[0]:,}")
 
     # Trim LESS to preserve filled area
     thresh = np.percentile(dens, TRIM_PERCENTILE)
     mesh.remove_vertices_by_mask(dens < thresh)
+    print(f"[RECON] Density trim percentile: {TRIM_PERCENTILE} -> threshold {thresh:.6f}")
 
     # Cleanup
     mesh.remove_degenerate_triangles()
@@ -255,6 +274,7 @@ def main():
 
     # Light smoothing
     if TAUBIN_ITERS > 0:
+        print(f"[RECON] Taubin smoothing: {TAUBIN_ITERS} iterations")
         mesh = mesh.filter_smooth_taubin(number_of_iterations=TAUBIN_ITERS)
 
     mesh.compute_vertex_normals()
@@ -271,7 +291,9 @@ def main():
             print("        Error:", e)
 
     # Save mesh
-    o3d.io.write_triangle_mesh(out_mesh, mesh, write_ascii=True)
+    ok = o3d.io.write_triangle_mesh(out_mesh, mesh, write_ascii=True)
+    if not ok:
+        raise IOError(f"Failed to save mesh: {out_mesh}")
     print(f"[SAVE] Mesh: {out_mesh}")
 
     print("[VIEW] Close the viewer window to continue...")
@@ -281,7 +303,11 @@ def main():
     if RESAMPLE_POINTS_FROM_MESH:
         print(f"[RESAMPLE] Sampling {RESAMPLE_N_POINTS:,} points from mesh...")
         pcd2 = mesh.sample_points_poisson_disk(number_of_points=RESAMPLE_N_POINTS)
-        o3d.io.write_point_cloud(out_fill_pts, pcd2, write_ascii=True)
+
+        ok = o3d.io.write_point_cloud(out_fill_pts, pcd2, write_ascii=True)
+        if not ok:
+            raise IOError(f"Failed to save resampled point cloud: {out_fill_pts}")
+
         print(f"[SAVE] Resampled points: {out_fill_pts}")
 
         print("[VIEW] Close the viewer window to finish...")
