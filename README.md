@@ -1,8 +1,6 @@
 # Universal-Phenotyping-Acquisition-Platform-UPAP-
 Universal Phenotyping Acquisition Platform
 
+## System flow
 
-path> /home/umap3/calib/right
-
-
-# pic :file:///C:/Users/yolzo57/Downloads/umapp_system_flow.svg
+![UPAP system flow](images/umapp_system_flow.svg)
