@@ -7,7 +7,7 @@ RoArm-M2 simple kinematics simulator (FK) with:
 - 3D visualization (NO grid lines)
 - Optional scan simulation (rings + sweep)
 - Save animation as GIF (needs pillow)
-
+ 
 Install:
   pip install numpy matplotlib pillow
 Run:
