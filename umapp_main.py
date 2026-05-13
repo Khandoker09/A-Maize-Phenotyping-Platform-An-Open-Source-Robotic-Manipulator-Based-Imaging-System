@@ -1,17 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import re
-import json
-import math
-import time
-import shlex
-import queue
-import signal
-import threading
-import subprocess
-import socket
+import os, io, sys, json, math, time, shlex, queue, signal
+import threading, subprocess, webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from datetime import datetime, timedelta
@@ -21,63 +12,90 @@ import requests
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
-# ================== DEFAULT SETTINGS ==================
+try:
+    from PIL import Image as PILImage, ImageTk
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
+
+_IS_WINDOWS = sys.platform.startswith("win")
+
+# ══════════════════════════════════════════════════════════════
+#  THEMES
+# ══════════════════════════════════════════════════════════════
+THEMES = {
+    "dark": {
+        "bg":        "#0f172a",
+        "surface":   "#1e293b",
+        "surface2":  "#243044",
+        "border":    "#334155",
+        "text":      "#e2e8f0",
+        "text2":     "#94a3b8",
+        "accent":    "#7c3aed",
+        "accent2":   "#6d28d9",
+        "success":   "#22c55e",
+        "warning":   "#f59e0b",
+        "error":     "#ef4444",
+        "btn_fg":    "#ffffff",
+        "entry_bg":  "#0f172a",
+        "entry_fg":  "#e2e8f0",
+        "log_bg":    "#0a0f1e",
+        "log_fg":    "#94a3b8",
+        "select_bg": "#7c3aed",
+        "tab_bg":    "#1e293b",
+        "tab_sel":   "#7c3aed",
+    },
+    "light": {
+        "bg":        "#f1f5f9",
+        "surface":   "#ffffff",
+        "surface2":  "#f8fafc",
+        "border":    "#e2e8f0",
+        "text":      "#1e293b",
+        "text2":     "#64748b",
+        "accent":    "#3b82f6",
+        "accent2":   "#2563eb",
+        "success":   "#16a34a",
+        "warning":   "#d97706",
+        "error":     "#dc2626",
+        "btn_fg":    "#ffffff",
+        "entry_bg":  "#ffffff",
+        "entry_fg":  "#1e293b",
+        "log_bg":    "#f8fafc",
+        "log_fg":    "#475569",
+        "select_bg": "#3b82f6",
+        "tab_bg":    "#ffffff",
+        "tab_sel":   "#3b82f6",
+    }
+}
+
+# ══════════════════════════════════════════════════════════════
+#  DEFAULTS
+# ══════════════════════════════════════════════════════════════
 DEFAULT = {
     "app_title": "Umapp v1",
-
     "robot_ssid": "RoArm-M2",
     "robot_pass": "12345678",
     "robot_base": "http://192.168.4.1",
     "safe_limit_deg": 175.0,
-
     "pi_host": "192.168.4.20",
-    "pi_ssh_port": 22,
-    "pi_user": "umap",
-    "pi_capture": "/home/umap/Desktop/capture_dual.py",
-
-"pi_auto_discover": True,
-"pi_subnet_prefix": "192.168.4.",
-"pi_scan_start": 2,
-"pi_scan_end": 80,
-    "ssh_opts": [
-        "-o", "BatchMode=yes",
-        "-o", "ConnectTimeout=8",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "PreferredAuthentications=publickey",
-        "-o", "PasswordAuthentication=no",
-        "-o", "LogLevel=ERROR",
-        "-o", "ServerAliveInterval=10",
-        "-o", "ServerAliveCountMax=3",
-    ],
-
+    "pi_port": 8765,
+    "pi_auto_discover": True,
+    "pi_subnet_prefix": "192.168.4.",
+    "pi_scan_start": 2,
+    "pi_scan_end": 80,
     "use_cameras": True,
     "rotate_180": True,
-
-    # Hold last pose
     "hold_last_pose": True,
-
-    # Hand
     "lock_hand_deg": 62.0,
-
-    # Base sweep center: plant is placed 90° from base
     "base_center_deg": 90.0,
     "base_half_span_deg": 155.0,
-
-    # Speed defaults
     "spd": 20,
     "acc": 20,
     "delay_s": 0.30,
-
-    # Modes
-    "mode": "Final",  # Calibration | Test | Final
+    "mode": "Final",
     "final_total_images": 200,
     "test_total_images": 10,
-
-    # Active profile used for scan
     "active_profile": "",
-
-    # Height mapping (auto rings)
     "height_low_cm": 10.0,
     "height_high_cm": 60.0,
     "pose_low_sh_deg": -84.0,
@@ -88,488 +106,245 @@ DEFAULT = {
     "ring_width_span_deg": 6.0,
     "elbow_push_gain": 0.8,
     "elbow_push_radius0_cm": 10.0,
-
-    # Angle clamps
-    "sh_min": -120.0,
-    "sh_max": -30.0,
-    "el_min": 20.0,
-    "el_max": 110.0,
-
-    # Plant profiles
-    "profiles": [
-        {
-            "name": "Plant_A",
-            "height_cm": 20.0,
-            "width_cm": 30.0,
-            "clearance_cm": 5.0,
-            "use_manual_rings": True,
-            "manual_rings": [
-                {"s": -84.0, "e": 92.0},
-                {"s": -74.0, "e": 82.0},
-                {"s": -64.0, "e": 72.0},
-            ],
-        }
-    ],
+    "sh_min": -120.0, "sh_max": -30.0,
+    "el_min": 20.0,   "el_max": 110.0,
+    "profiles": [{
+        "name": "Plant_A",
+        "height_cm": 20.0, "width_cm": 30.0, "clearance_cm": 5.0,
+        "use_manual_rings": True,
+        "manual_rings": [{"s":-84.0,"e":92.0},{"s":-74.0,"e":82.0},{"s":-64.0,"e":72.0}],
+    }],
 }
 
-# ================== LOCAL SYSTEM HELPERS ==================
-def _run(cmd_list, timeout=None):
-    return subprocess.run(cmd_list, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
-
+# ══════════════════════════════════════════════════════════════
+#  WIFI (Linux only)
+# ══════════════════════════════════════════════════════════════
 def _sh(cmd):
     p = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return p.returncode, p.stdout.strip(), p.stderr.strip()
 
-def _wifi_device():
-    rc, out, err = _sh("nmcli -t -f DEVICE,TYPE device status")
-    for line in out.splitlines():
-        parts = line.split(":")
-        if len(parts) >= 2 and parts[1] == "wifi":
-            return parts[0]
-    raise RuntimeError("No Wi-Fi device found (nmcli).")
-
 def ensure_connected_to(ssid, password=None):
+    if _IS_WINDOWS:
+        return True
     try:
-        rc, out, err = _sh("nmcli -t -f ACTIVE,SSID dev wifi")
+        rc, out, _ = _sh("nmcli -t -f ACTIVE,SSID dev wifi")
         for line in out.splitlines():
-            if line.startswith("yes:"):
-                cur = line.split(":", 1)[1]
-                if cur == ssid:
-                    return True
-    except Exception:
-        pass
-
-    dev = _wifi_device()
-    cmd = 'nmcli dev wifi connect "{}"'.format(ssid)
-    if password:
-        cmd += ' password "{}"'.format(password)
-    cmd += " ifname {}".format(dev)
-    rc, out, err = _sh(cmd)
-
-    try:
-        rc2, out2, err2 = _sh("nmcli -t -f ACTIVE,SSID dev wifi")
-        for line in out2.splitlines():
-            if line.startswith("yes:") and line.split(":", 1)[1] == ssid:
+            if line.startswith("yes:") and line.split(":",1)[1] == ssid:
                 return True
     except Exception:
         pass
-
-    if rc != 0:
-        raise RuntimeError(err or out or "Could not connect to SSID {}".format(ssid))
+    try:
+        rc2, out2, _ = _sh("nmcli -t -f DEVICE,TYPE device status")
+        dev = next((l.split(":")[0] for l in out2.splitlines()
+                    if len(l.split(":"))>=2 and l.split(":")[1]=="wifi"), "")
+        if not dev: raise RuntimeError("No Wi-Fi device")
+        cmd = f'nmcli dev wifi connect "{ssid}"'
+        if password: cmd += f' password "{password}"'
+        cmd += f" ifname {dev}"
+        rc3, out3, err3 = _sh(cmd)
+        if rc3 != 0: raise RuntimeError(err3 or out3)
+    except Exception as e:
+        raise RuntimeError(str(e))
     return True
 
-# ================== ROBOT (HTTP) ==================
+# ══════════════════════════════════════════════════════════════
+#  ROBOT HTTP
+# ══════════════════════════════════════════════════════════════
 _SESSION = requests.Session()
 
-def send_cmd(cfg, cmd, retries=3, auto_wifi=True, log=None):
-    url = "{}{}".format(cfg["robot_base"], "/js?json=" + quote(json.dumps(cmd)))
+def send_cmd(cfg, cmd, retries=3, log=None):
+    url = cfg["robot_base"] + "/js?json=" + quote(json.dumps(cmd))
     for attempt in range(retries):
         try:
-            r = _SESSION.get(url, timeout=(3, 6))
-            return r.json()
+            return _SESSION.get(url, timeout=(3,6)).json()
         except Exception as e:
-            if log:
-                log("[WARN] Robot cmd failed ({}/{}): {}".format(attempt + 1, retries, e))
+            if log: log(f"[WARN] Robot ({attempt+1}/{retries}): {e}")
             time.sleep(1)
-            if auto_wifi:
-                try:
-                    ensure_connected_to(cfg["robot_ssid"], cfg["robot_pass"])
-                except Exception as ee:
-                    if log:
-                        log("[WARN] Wi-Fi reconnect failed: {}".format(ee))
-    raise RuntimeError("Robot unreachable after retries.")
+    raise RuntimeError("Robot unreachable.")
 
 def get_feedback(cfg, log=None):
-    fb = send_cmd(cfg, {"T": 105}, log=log)
-    if isinstance(fb, str):
-        fb = json.loads(fb)
-    return fb
+    fb = send_cmd(cfg, {"T":105}, log=log)
+    return json.loads(fb) if isinstance(fb, str) else fb
 
 def torque(cfg, on=True, log=None):
-    send_cmd(cfg, {"T": 210, "cmd": (1 if on else 0)}, log=log)
+    send_cmd(cfg, {"T":210,"cmd":(1 if on else 0)}, log=log)
 
-def move_joints_deg(cfg, base=None, shoulder=None, elbow=None, hand=None, spd=None, acc=None, log=None):
+def move_joints_deg(cfg, base=None, shoulder=None, elbow=None, hand=None,
+                    spd=None, acc=None, log=None):
     fb = get_feedback(cfg, log=log)
-    payload = {
-        "T": 122,
-        "b": base if base is not None else math.degrees(fb["b"]),
+    send_cmd(cfg, {"T":122,
+        "b": base     if base     is not None else math.degrees(fb["b"]),
         "s": shoulder if shoulder is not None else math.degrees(fb["s"]),
-        "e": elbow if elbow is not None else math.degrees(fb["e"]),
-        "h": hand if hand is not None else math.degrees(fb["t"]),
-        "spd": int(spd if spd is not None else cfg["spd"]),
-        "acc": int(acc if acc is not None else cfg["acc"]),
-    }
-    send_cmd(cfg, payload, log=log)
+        "e": elbow    if elbow    is not None else math.degrees(fb["e"]),
+        "h": hand     if hand     is not None else math.degrees(fb["t"]),
+        "spd": int(spd or cfg["spd"]), "acc": int(acc or cfg["acc"])}, log=log)
     time.sleep(0.45)
     return get_feedback(cfg, log=log)
 
-# ================== PI (SSH) ==================
-def _ping(host):
-    return subprocess.run(["ping", "-c", "1", "-W", "2", host], stdout=subprocess.DEVNULL).returncode == 0
+# ══════════════════════════════════════════════════════════════
+#  PI HTTP
+# ══════════════════════════════════════════════════════════════
+def _pi_base(cfg):
+    return f"http://{cfg.get('pi_host','')}:{int(cfg.get('pi_port',8765))}"
 
+def _pi_get(cfg, endpoint, params=None, timeout=10):
+    return requests.get(_pi_base(cfg)+endpoint, params=params, timeout=timeout).json()
 
-# Quick TCP check (distinguish 'refused' vs 'timeout')
-def _tcp_check(host, port, timeout=0.8):
-    try:
-        with socket.create_connection((host, int(port)), timeout=timeout):
-            return True, ""
-    except Exception as e:
-        return False, str(e)
-
-def _is_ipv4(s):
-    return bool(re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", str(s).strip()))
-
-def discover_ssh_hosts(prefix, port=22, start=2, end=80, timeout=0.25, max_workers=64):
-    """
-    Scan prefix like '192.168.4.' for hosts with TCP port open.
-    Keeps scan small/fast by default (start..end).
-    """
-    start = int(start); end = int(end)
-    start = max(1, min(254, start))
-    end = max(1, min(254, end))
-    if end < start:
-        start, end = end, start
-
-    ips = [f"{prefix}{i}" for i in range(start, end + 1)]
+def _discover_http(prefix, port, start, end, timeout=0.5, max_workers=32):
+    ips = [f"{prefix}{i}" for i in range(int(start), int(end)+1)]
     found = []
-
     def check(ip):
-        ok, _ = _tcp_check(ip, port, timeout=timeout)
-        return ip if ok else None
-
+        try:
+            r = requests.get(f"http://{ip}:{port}/status", timeout=timeout)
+            if r.json().get("ok"): return ip
+        except Exception: pass
+        return None
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(check, ip) for ip in ips]
-        for fut in as_completed(futs):
-            ip = fut.result()
-            if ip:
-                found.append(ip)
+        for ip in [f.result() for f in as_completed([ex.submit(check,ip) for ip in ips])]:
+            if ip: found.append(ip)
+    return sorted(found, key=lambda x:[int(p) for p in x.split(".")])
 
-    found.sort(key=lambda x: [int(p) for p in x.split(".")])
-    return found
-
-
-def ensure_pi_ssh(cfg, log=None):
-    """
-    Robust Pi SSH availability check with **optional auto-discovery**.
-
-    Why you see "Connection refused":
-      - Pi IP changed (DHCP) OR
-      - Another device took 192.168.4.2 OR
-      - Pi not on the robot Wi‑Fi at that moment
-
-    Strategy:
-      1) Try configured host:port using a quick TCP connect.
-      2) If it fails and auto-discovery is enabled, scan a small IP range for open SSH (port 22).
-      3) If found, update cfg['pi_host'] to the discovered IP (and log it).
-      4) Finally run a real SSH "true" command (source of truth).
-    """
+def ensure_pi_http(cfg, log=None):
     host = (cfg.get("pi_host") or "").strip()
-    port = int(cfg.get("pi_ssh_port", 22))
-    user = (cfg.get("pi_user") or "").strip()
-    opts = cfg.get("ssh_opts", [])
-
-    if not user:
-        return False, "Pi user not set"
-
-    # 1) quick TCP check on configured host
-    if host:
-        ok_tcp, err_tcp = _tcp_check(host, port, timeout=0.6)
-        if not ok_tcp:
-            # 2) auto-discover
-            if cfg.get("pi_auto_discover", True):
-                prefix = (cfg.get("pi_subnet_prefix") or "192.168.4.").strip()
-                start = int(cfg.get("pi_scan_start", 2))
-                end = int(cfg.get("pi_scan_end", 80))
-                if log:
-                    log(f"[Pi] SSH not reachable at {host}:{port} ({err_tcp}). Scanning {prefix}{start}-{end}…")
-                candidates = discover_ssh_hosts(prefix, port=port, start=start, end=end, timeout=0.20, max_workers=64)
-                if candidates:
-                    host = candidates[0]
-                    cfg["pi_host"] = host  # update in-memory config
-                    if log:
-                        log(f"[Pi] Found SSH at {host}:{port}. Using this IP ✅")
-                else:
-                    return False, f"SSH not reachable at {host}:{port} ({err_tcp}); scan found no SSH hosts"
-            else:
-                return False, f"SSH not reachable at {host}:{port} ({err_tcp})"
-    else:
-        return False, "Pi host not set"
-
-    # 3) real SSH test
-    cmd = ["ssh", "-p", str(port), *opts, f"{user}@{host}", "true"]
+    port = int(cfg.get("pi_port", 8765))
+    if not host: return False, "Pi host not set"
     try:
-        p = _run(cmd, timeout=8)
+        r = requests.get(f"http://{host}:{port}/status", timeout=5)
+        if r.json().get("ok"): return True, f"HTTP OK  {host}:{port}"
     except Exception as e:
+        if cfg.get("pi_auto_discover", True):
+            prefix = (cfg.get("pi_subnet_prefix") or "192.168.4.").strip()
+            start  = int(cfg.get("pi_scan_start", 2))
+            end    = int(cfg.get("pi_scan_end",  80))
+            if log: log(f"[Pi] Scanning {prefix}{start}–{end}…")
+            found = _discover_http(prefix, port, start, end)
+            if found:
+                cfg["pi_host"] = found[0]
+                if log: log(f"[Pi] Found at {found[0]}:{port} ✅")
+                return True, f"HTTP OK  {found[0]}:{port}"
+            return False, f"Not reachable ({e}) — nothing found"
         return False, str(e)
+    return False, "Pi not responding"
 
-    if p.returncode == 0:
-        return True, f"SSH OK {host}:{port}"
-
-    msg = (p.stderr or "").strip() or (p.stdout or "").strip() or f"SSH failed {host}:{port}"
-    return False, msg
-
-
-def ssh_run(pi_user, pi_host, ssh_opts, remote_cmd, timeout=25, port=22):
-    cmd = ["ssh", "-p", str(port), *ssh_opts, "{}@{}".format(pi_user, pi_host), remote_cmd]
-    return _run(cmd, timeout=timeout)
-
-def ssh_retry(cfg, remote_cmd_list, timeout=25, tries=3, log=None):
-    ok, msg = ensure_pi_ssh(cfg, log=log)
-    if not ok:
-        # mimic ssh failure return
-        return subprocess.CompletedProcess(args=[], returncode=255, stdout="", stderr=msg)
-    remote = " ".join([shlex.quote(str(x)) for x in remote_cmd_list])
-    last = None
-    for i in range(tries):
-        p = ssh_run(cfg["pi_user"], cfg["pi_host"], cfg["ssh_opts"], remote, timeout=timeout, port=int(cfg.get("pi_ssh_port", 22)))
-        last = p
-        if p.returncode == 0:
-            return p
-        if log:
-            log("SSH WARN ({}/{}): {}".format(i + 1, tries, (p.stderr.strip() or p.stdout.strip())))
-        time.sleep(0.6)
-    return last
-
-def pi_test_ssh(cfg):
-    """
-    Returns (ok, msg). If ok is False, msg contains the SSH error (e.g. "Connection refused").
-    """
-    p = ssh_run(cfg["pi_user"], cfg["pi_host"], cfg["ssh_opts"], "echo SSH_OK",
-                timeout=8, port=int(cfg.get("pi_ssh_port", 22)))
-    ok = (p.returncode == 0 and "SSH_OK" in (p.stdout or ""))
-    msg = (p.stderr.strip() or p.stdout.strip())
-    return ok, msg
-
-def pi_detect_usb_mount(cfg, log=None):
-    ok, msg = ensure_pi_ssh(cfg, log=log)
-    if not ok:
-        return ""
-    script = r"""bash -lc '
-for d in /media/*/*; do
-  if [ -d "$d" ] && mountpoint -q "$d"; then
-    echo "$d"
-    exit 0
-  fi
-done
-exit 0
-'"""
-    p = ssh_run(cfg["pi_user"], cfg["pi_host"], cfg["ssh_opts"], script, timeout=10, port=int(cfg.get("pi_ssh_port", 22)))
-    return (p.stdout or "").strip()
+def pi_get_storage(cfg, log=None):
+    """Returns the active storage path on Pi (USB or SD card)."""
+    try:
+        data = _pi_get(cfg, "/storage", timeout=8)
+        return data.get("path", "/home/umap/captures"), data.get("type", "SD")
+    except Exception:
+        return "/home/umap/captures", "SD"
 
 def pi_mkdir(cfg, path, log=None):
-    ok0, msg0 = ensure_pi_ssh(cfg, log=log)
-    if not ok0:
-        return False, msg0
-    cmd = "bash -lc {}".format(shlex.quote('mkdir -p -- "{}"'.format(path)))
-    p = ssh_run(cfg["pi_user"], cfg["pi_host"], cfg["ssh_opts"], cmd, timeout=15, port=int(cfg.get("pi_ssh_port", 22)))
-    ok = (p.returncode == 0)
-    msg = (p.stderr.strip() or p.stdout.strip())
-    return ok, msg
-
-_SAVED_RE = re.compile(r"Saved:\s+(\S+)\s+and\s+(\S+)", re.IGNORECASE)
+    ok0, msg0 = ensure_pi_http(cfg, log=log)
+    if not ok0: return False, msg0
+    try:
+        data = _pi_get(cfg, "/mkdir", params={"path": path}, timeout=15)
+        return data.get("ok", False), data.get("error", "")
+    except Exception as e:
+        return False, str(e)
 
 def trigger_capture_store_rotate(cfg, tag, target_dir, log=None):
-    if not cfg["use_cameras"]:
+    if not cfg["use_cameras"]: return True
+    rotate = "1" if cfg.get("rotate_180") else "0"
+    try:
+        data = _pi_get(cfg, "/capture", params={"tag": tag}, timeout=30)
+        if not data.get("ok"):
+            if log: log("CAPTURE FAIL | {}".format(data.get("error","unknown")))
+            return False
+        captured_file = data.get("file","")
+        if not captured_file:
+            if log: log("CAPTURE FAIL | No file path"); return False
+        data2 = _pi_get(cfg, "/move",
+                        params={"src": captured_file, "dst": target_dir, "rotate": rotate},
+                        timeout=30)
+        if not data2.get("ok"):
+            if log: log("STORE WARN | {}".format(data2.get("error","")))
         return True
-
-    # Do NOT rely on ping (it can be misleading). SSH is the truth.
-
-    p = ssh_retry(cfg, ["python3", cfg["pi_capture"], str(tag)], timeout=60, tries=3, log=log)
-    if p is None or p.returncode != 0:
-        if log:
-            log("CAPTURE FAIL | {}".format((p.stderr.strip() if p else "ssh failed")))
+    except Exception as e:
+        if log: log(f"CAPTURE ERROR | {e}")
         return False
 
-    out = p.stdout or ""
-    m = _SAVED_RE.search(out)
-    if not m:
-        if log:
-            log("CAPTURE WARN | Could not parse Saved line. Output:\n{}".format(out[:220]))
-        return True
+# ══════════════════════════════════════════════════════════════
+#  PLANNING
+# ══════════════════════════════════════════════════════════════
+def clamp(x,a,b): return max(a,min(b,x))
+def clip_base_deg(a,lim): return clamp(a,-lim,lim)
 
-    p0, p1 = m.group(1), m.group(2)
+def plan_angles_centered(center, half, count, safe_lim, start_b=None):
+    half = min(float(half), float(safe_lim))
+    center = clip_base_deg(float(center), safe_lim)
+    lo = clip_base_deg(center-half, safe_lim)
+    hi = clip_base_deg(center+half, safe_lim)
+    if count <= 1: return [center]
+    arr = [lo + i*(hi-lo)/(count-1) for i in range(count)]
+    if start_b is None: return arr
+    start_b = clip_base_deg(float(start_b), safe_lim)
+    best = min(range(len(arr)), key=lambda i: abs(arr[i]-start_b))
+    return arr[best:] + arr[:best]
 
-    ok, msg = pi_mkdir(cfg, target_dir, log=log)
-    if not ok:
-        if log:
-            log("CAPTURE FAIL | Could not create target folder: {}".format(msg))
-        return False
+def compute_mid_pose(cfg, height_cm):
+    h0,h1 = float(cfg["height_low_cm"]), float(cfg["height_high_cm"])
+    t = clamp(0 if h1==h0 else (float(height_cm)-h0)/(h1-h0), 0,1)
+    s = float(cfg["pose_low_sh_deg"]) + t*(float(cfg["pose_high_sh_deg"])-float(cfg["pose_low_sh_deg"]))
+    e = float(cfg["pose_low_el_deg"]) + t*(float(cfg["pose_high_el_deg"])-float(cfg["pose_low_el_deg"]))
+    return clamp(s,float(cfg["sh_min"]),float(cfg["sh_max"])), clamp(e,float(cfg["el_min"]),float(cfg["el_max"])), t
 
-    dest0 = os.path.join(target_dir, os.path.basename(p0))
-    dest1 = os.path.join(target_dir, os.path.basename(p1))
-
-    rotate_block = ""
-    if cfg["rotate_180"]:
-        rotate_block = r"""
-python3 - <<'PY' "$f0" "$f1"
-import sys
-files = sys.argv[1:]
-try:
-    from PIL import Image
-except Exception:
-    print("NO_PIL")
-    sys.exit(0)
-for f in files:
-    im = Image.open(f)
-    im = im.rotate(180, expand=True)
-    im.save(f, quality=95)
-print("ROT_OK", len(files))
-PY
-"""
-    else:
-        rotate_block = "true\n"
-
-    remote_script = "\n".join([
-        "set -e",
-        'mkdir -p -- "{}"'.format(target_dir),
-        'mv -f "{}" "{}" "{}/"'.format(p0, p1, target_dir),
-        'f0="{}"'.format(dest0),
-        'f1="{}"'.format(dest1),
-        rotate_block,
-        'echo "OK_STORE"'
-    ])
-
-    p2 = ssh_run(cfg["pi_user"], cfg["pi_host"], cfg["ssh_opts"],
-                 "bash -lc {}".format(shlex.quote(remote_script)),
-                 timeout=60, port=int(cfg.get("pi_ssh_port", 22)))
-
-    if p2.returncode != 0:
-        if log:
-            log("STORE/ROTATE WARN | {}".format(p2.stderr.strip() or p2.stdout.strip()))
-        return True
-
-    if cfg["rotate_180"] and log:
-        txt = (p2.stdout or "")
-        if "NO_PIL" in txt:
-            log("ROTATE WARN | Pillow missing on Pi. Install: sudo apt install -y python3-pil")
-        elif "ROT_OK" in txt:
-            log("Rotate 180° OK ✅")
-
-    return True
-
-# ================== PLANNING ==================
-def clamp(x, a, b):
-    return max(a, min(b, x))
-
-def clip_base_deg(angle, safe_limit):
-    return clamp(angle, -safe_limit, safe_limit)
-
-def plan_angles_centered(center_deg, half_span_deg, count, safe_limit_deg, start_b_deg=None):
-    half_span_deg = min(float(half_span_deg), float(safe_limit_deg))
-    center_deg = clip_base_deg(float(center_deg), safe_limit_deg)
-
-    lo = clip_base_deg(center_deg - half_span_deg, safe_limit_deg)
-    hi = clip_base_deg(center_deg + half_span_deg, safe_limit_deg)
-
-    if count <= 1:
-        return [clip_base_deg(center_deg, safe_limit_deg)]
-
-    step = (hi - lo) / float(count - 1)
-    arr = [lo + i * step for i in range(count)]
-
-    if start_b_deg is None:
-        return arr
-
-    start_b_deg = clip_base_deg(float(start_b_deg), safe_limit_deg)
-    best_i = min(range(len(arr)), key=lambda i: abs(arr[i] - start_b_deg))
-    return arr[best_i:] + arr[:best_i]
-
-def compute_mid_pose_from_height(cfg, height_cm):
-    h0 = float(cfg["height_low_cm"])
-    h1 = float(cfg["height_high_cm"])
-    t = 0.0 if h1 == h0 else (float(height_cm) - h0) / (h1 - h0)
-    t = clamp(t, 0.0, 1.0)
-
-    s0 = float(cfg["pose_low_sh_deg"])
-    e0 = float(cfg["pose_low_el_deg"])
-    s1 = float(cfg["pose_high_sh_deg"])
-    e1 = float(cfg["pose_high_el_deg"])
-
-    s_mid = s0 + t * (s1 - s0)
-    e_mid = e0 + t * (e1 - e0)
-
-    s_mid = clamp(s_mid, float(cfg["sh_min"]), float(cfg["sh_max"]))
-    e_mid = clamp(e_mid, float(cfg["el_min"]), float(cfg["el_max"]))
-    return s_mid, e_mid, t
-
-def compute_elbow_push(cfg, width_cm, clearance_cm):
-    radius = float(width_cm) / 2.0 + float(clearance_cm)
-    r0 = float(cfg["elbow_push_radius0_cm"])
-    gain = float(cfg["elbow_push_gain"])
-    extra = max(0.0, (radius - r0) * gain)
-    return extra, radius
-
-def compute_rings_auto(cfg, height_cm, width_cm, clearance_cm):
-    s_mid, e_mid, t = compute_mid_pose_from_height(cfg, height_cm)
-
-    effective_w = float(width_cm) + 2.0 * float(clearance_cm)
-    width_scale = clamp(20.0 / max(1e-6, effective_w), 0.25, 1.0)
-
-    span_w = float(cfg["ring_width_span_deg"]) * width_scale
-    span_h = float(cfg["ring_height_span_deg"]) * clamp(0.7 + 0.6 * t, 0.5, 1.3)
-
-    elbow_extra, radius = compute_elbow_push(cfg, width_cm, clearance_cm)
-    e_mid2 = clamp(e_mid + elbow_extra, float(cfg["el_min"]), float(cfg["el_max"]))
-    s_mid2 = clamp(s_mid, float(cfg["sh_min"]), float(cfg["sh_max"]))
-
-    ring1 = (s_mid2 - (span_w + span_h), e_mid2 + (span_w + span_h))
-    ring2 = (s_mid2,                   e_mid2)
-    ring3 = (s_mid2 + (span_w + span_h), e_mid2 - (span_w + span_h))
-
-    def clamp_pose(p):
-        s, e = p
-        return (
-            clamp(s, float(cfg["sh_min"]), float(cfg["sh_max"])),
-            clamp(e, float(cfg["el_min"]), float(cfg["el_max"]))
-        )
-
-    rings = [clamp_pose(ring1), clamp_pose(ring2), clamp_pose(ring3)]
-    return rings, width_scale, effective_w, elbow_extra, radius, (s_mid2, e_mid2)
+def compute_rings_auto(cfg, h,w,c):
+    s_mid,e_mid,t = compute_mid_pose(cfg,h)
+    ew = w + 2*c
+    ws = clamp(20/max(1e-6,ew), 0.25, 1.0)
+    sw = float(cfg["ring_width_span_deg"])*ws
+    sh = float(cfg["ring_height_span_deg"])*clamp(0.7+0.6*t, 0.5, 1.3)
+    r  = w/2+c
+    ee = max(0,(r-float(cfg["elbow_push_radius0_cm"]))*float(cfg["elbow_push_gain"]))
+    s2 = clamp(s_mid, float(cfg["sh_min"]), float(cfg["sh_max"]))
+    e2 = clamp(e_mid+ee, float(cfg["el_min"]), float(cfg["el_max"]))
+    def cp(s,e): return (clamp(s,float(cfg["sh_min"]),float(cfg["sh_max"])),
+                         clamp(e,float(cfg["el_min"]),float(cfg["el_max"])))
+    return ([cp(s2-(sw+sh),e2+(sw+sh)), cp(s2,e2), cp(s2+(sw+sh),e2-(sw+sh))],
+            ws, ew, ee, r, (s2,e2))
 
 def get_profile(cfg, name):
-    for p in cfg.get("profiles", []):
-        if p.get("name") == name:
-            return p
-    return None
+    return next((p for p in cfg.get("profiles",[]) if p.get("name")==name), None)
 
-def compute_rings_from_profile(cfg, profile):
-    h = float(profile.get("height_cm", 20.0))
-    w = float(profile.get("width_cm", 30.0))
-    c = float(profile.get("clearance_cm", 5.0))
+def compute_rings_from_profile(cfg, prof):
+    h,w,c = float(prof.get("height_cm",20)), float(prof.get("width_cm",30)), float(prof.get("clearance_cm",5))
+    if prof.get("use_manual_rings"):
+        mr = [(float(r.get("s",-80)),float(r.get("e",90))) for r in prof.get("manual_rings",[])[:3]]
+        if len(mr)==3:
+            auto,ws,ew,ee,rad,mid = compute_rings_auto(cfg,h,w,c)
+            return mr, ws, ew, ee, rad, mid, False
+    auto,ws,ew,ee,rad,mid = compute_rings_auto(cfg,h,w,c)
+    return auto, ws, ew, ee, rad, mid, True
 
-    if bool(profile.get("use_manual_rings", False)):
-        rings = []
-        for r in profile.get("manual_rings", [])[:3]:
-            rings.append((float(r.get("s", -80.0)), float(r.get("e", 90.0))))
-        if len(rings) == 3:
-            rings_auto, ws, ew, ee, rad, mid = compute_rings_auto(cfg, h, w, c)
-            return rings, ws, ew, ee, rad, mid, False
+# ══════════════════════════════════════════════════════════════
+#  APP
+# ══════════════════════════════════════════════════════════════
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.cfg  = deepcopy(DEFAULT)
+        self.theme_name = "dark"
+        self.T = THEMES[self.theme_name]
 
-    rings, ws, ew, ee, rad, mid = compute_rings_auto(cfg, h, w, c)
-    return rings, ws, ew, ee, rad, mid, True
+        self.root.title("Umapp v1")
+        self.root.geometry("1320x880")
+        self.root.minsize(1100, 700)
 
-# ================== UI ==================
-class App(ttk.Frame):
-    def __init__(self, master):
-        super().__init__(master)
-        self.master = master
-        self.cfg = deepcopy(DEFAULT)
-
-        self.master.title(self.cfg["app_title"])
-        self.master.geometry("1250x840")
-
-        self.log_q = queue.Queue()
+        self.log_q       = queue.Queue()
         self.abort_event = threading.Event()
-        self.worker = None
+        self.worker      = None
+        self._live_running = False
+        self._live_thread  = None
+        self._live_photo   = None
 
         self._build_ui()
+        self._apply_theme()
         self._poll_logs()
         signal.signal(signal.SIGINT, lambda *_: self.on_abort())
-
-        # Ensure an active profile exists
         self._ensure_active_profile()
 
-    # ---------- logging ----------
+    # ── logging ──────────────────────────────────────────────
     def log(self, msg):
         self.log_q.put(msg)
 
@@ -577,52 +352,186 @@ class App(ttk.Frame):
         try:
             while True:
                 msg = self.log_q.get_nowait()
-                self.txt.insert("end", msg + "\n")
+                self.txt.configure(state="normal")
+                ts = datetime.now().strftime("%H:%M:%S")
+                # colour-code lines
+                tag = "normal"
+                if "✅" in msg or "OK" in msg or "DONE" in msg: tag = "ok"
+                elif "FAIL" in msg or "ERROR" in msg or "❌" in msg: tag = "err"
+                elif "WARN" in msg or "warning" in msg: tag = "warn"
+                elif msg.startswith("---") or msg.startswith("Ring") or msg.startswith("Progress"): tag = "info"
+                self.txt.insert("end", f"[{ts}] {msg}\n", tag)
                 self.txt.see("end")
+                self.txt.configure(state="disabled")
         except queue.Empty:
             pass
-        self.master.after(100, self._poll_logs)
+        self.root.after(100, self._poll_logs)
 
     def set_progress(self, frac, label):
-        frac = max(0.0, min(1.0, float(frac)))
-        self.progress["value"] = frac * 100.0
+        frac = max(0.0, min(1.0, frac))
+        self.progress["value"] = frac * 100
         self.lbl_prog.configure(text=label)
 
-    # ---------- UI build ----------
-    def _build_ui(self):
+    # ── theme ─────────────────────────────────────────────────
+    def toggle_theme(self):
+        self.theme_name = "light" if self.theme_name == "dark" else "dark"
+        self.T = THEMES[self.theme_name]
+        self._apply_theme()
+        icon = "☀️" if self.theme_name == "dark" else "🌙"
+        self.btn_theme.configure(text=icon)
+
+    def _apply_theme(self):
+        T = self.T
+        self.root.configure(bg=T["bg"])
         style = ttk.Style()
         style.theme_use("clam")
 
-        top = ttk.Frame(self.master)
-        top.pack(fill=tk.X, padx=10, pady=(10, 0))
-        ttk.Label(top, text="Umapp v1", font=("Arial", 20, "bold")).pack(side=tk.LEFT)
-        ttk.Label(top, text="(Photogeometry platform)",
-                  foreground="#444").pack(side=tk.LEFT, padx=10)
+        style.configure(".",
+            background=T["bg"], foreground=T["text"],
+            fieldbackground=T["entry_bg"], troughcolor=T["surface"],
+            bordercolor=T["border"], darkcolor=T["surface"], lightcolor=T["surface"],
+            selectbackground=T["select_bg"], selectforeground="#ffffff",
+            font=("Segoe UI", 10))
 
-        paned = ttk.PanedWindow(self.master, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        style.configure("TFrame",      background=T["bg"])
+        style.configure("TLabel",      background=T["bg"],      foreground=T["text"],      font=("Segoe UI", 10))
+        style.configure("TCheckbutton",background=T["bg"],      foreground=T["text"],      font=("Segoe UI", 10))
+        style.configure("TEntry",      fieldbackground=T["entry_bg"], foreground=T["entry_fg"],
+                        insertcolor=T["text"], bordercolor=T["border"], font=("Segoe UI", 10))
+        style.configure("TCombobox",   fieldbackground=T["entry_bg"], foreground=T["entry_fg"],
+                        selectbackground=T["select_bg"], font=("Segoe UI", 10))
+        style.configure("TScale",      background=T["bg"], troughcolor=T["surface2"],
+                        sliderrelief="flat")
 
-        left = ttk.Frame(paned)
-        right = ttk.Frame(paned)
-        paned.add(left, weight=3)
-        paned.add(right, weight=2)
+        # LabelFrame
+        style.configure("TLabelframe",       background=T["surface"], foreground=T["text2"],
+                        bordercolor=T["border"], relief="flat", font=("Segoe UI", 9))
+        style.configure("TLabelframe.Label",  background=T["surface"], foreground=T["text2"],
+                        font=("Segoe UI", 9, "bold"))
 
+        # Notebook
+        style.configure("TNotebook",          background=T["bg"],      bordercolor=T["border"])
+        style.configure("TNotebook.Tab",       background=T["surface"], foreground=T["text2"],
+                        padding=[14,8], font=("Segoe UI", 10))
+        style.map("TNotebook.Tab",
+            background=[("selected", T["accent"])],
+            foreground=[("selected", "#ffffff")])
+
+        # Buttons — accent
+        style.configure("Accent.TButton",
+            background=T["accent"], foreground="#ffffff",
+            relief="flat", borderwidth=0, padding=[14,8],
+            font=("Segoe UI", 10, "bold"))
+        style.map("Accent.TButton",
+            background=[("active", T["accent2"]), ("pressed", T["accent2"])])
+
+        # Buttons — secondary
+        style.configure("TButton",
+            background=T["surface2"], foreground=T["text"],
+            relief="flat", borderwidth=0, padding=[12,6],
+            font=("Segoe UI", 10))
+        style.map("TButton",
+            background=[("active", T["border"]), ("pressed", T["border"])])
+
+        # Danger button
+        style.configure("Danger.TButton",
+            background=T["error"], foreground="#ffffff",
+            relief="flat", borderwidth=0, padding=[14,8],
+            font=("Segoe UI", 10, "bold"))
+        style.map("Danger.TButton",
+            background=[("active","#b91c1c"), ("pressed","#b91c1c")])
+
+        # Progressbar
+        style.configure("TProgressbar",
+            troughcolor=T["surface2"], background=T["accent"],
+            thickness=8, borderwidth=0)
+
+        # Separator
+        style.configure("TSeparator", background=T["border"])
+
+        # Scrollbar
+        style.configure("TScrollbar",
+            background=T["surface2"], troughcolor=T["surface"],
+            bordercolor=T["border"], arrowcolor=T["text2"],
+            relief="flat")
+
+        # log colours
+        self.txt.configure(bg=T["log_bg"], fg=T["log_fg"],
+                           insertbackground=T["text"], font=("Consolas",9),
+                           selectbackground=T["select_bg"])
+        self.txt.tag_configure("ok",   foreground=T["success"])
+        self.txt.tag_configure("err",  foreground=T["error"])
+        self.txt.tag_configure("warn", foreground=T["warning"])
+        self.txt.tag_configure("info", foreground=T["accent"])
+        self.txt.tag_configure("normal", foreground=T["log_fg"])
+
+        # header / sidebar backgrounds
+        for w in getattr(self, "_surface_frames", []):
+            try: w.configure(bg=T["surface"])
+            except Exception: pass
+        for w in getattr(self, "_bg_frames", []):
+            try: w.configure(bg=T["bg"])
+            except Exception: pass
+
+        # live view canvas
+        if hasattr(self, "live_canvas"):
+            self.live_canvas.configure(bg="#0a0f1e" if self.theme_name=="dark" else "#e2e8f0")
+
+    # ── UI build ─────────────────────────────────────────────
+    def _build_ui(self):
+        self._surface_frames = []
+        self._bg_frames      = []
+
+        # ── Header bar ───────────────────────────────────────
+        hdr = tk.Frame(self.root, height=56)
+        hdr.pack(fill=tk.X, padx=0, pady=0)
+        hdr.pack_propagate(False)
+        self._surface_frames.append(hdr)
+
+        tk.Label(hdr, text="Umapp v1", font=("Segoe UI", 18, "bold"),
+                 fg="#7c3aed", bg=THEMES["dark"]["surface"]).pack(side=tk.LEFT, padx=20, pady=12)
+        tk.Label(hdr, text="Photogeometry Platform", font=("Segoe UI", 10),
+                 fg=THEMES["dark"]["text2"], bg=THEMES["dark"]["surface"]).pack(side=tk.LEFT)
+
+        # Theme toggle
+        self.btn_theme = tk.Button(hdr, text="☀️", font=("Segoe UI",14),
+                                   command=self.toggle_theme, relief="flat",
+                                   bg=THEMES["dark"]["surface"], fg=THEMES["dark"]["text"],
+                                   cursor="hand2", bd=0, padx=12)
+        self.btn_theme.pack(side=tk.RIGHT, pady=8, padx=8)
+
+        # Browse images button
+        ttk.Button(hdr, text="🌐 Browse Images", style="TButton",
+                   command=self.open_browser).pack(side=tk.RIGHT, pady=10, padx=4)
+
+        # ── Main body ────────────────────────────────────────
+        body = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        body.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+
+        left  = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left,  weight=3)
+        body.add(right, weight=2)
+
+        # ── Notebook ─────────────────────────────────────────
         nb = ttk.Notebook(left)
-        nb.pack(fill=tk.BOTH, expand=True)
+        nb.pack(fill=tk.BOTH, expand=True, padx=12, pady=(8,0))
 
-        self.tab_conn = ttk.Frame(nb)
+        self.tab_conn     = ttk.Frame(nb)
         self.tab_profiles = ttk.Frame(nb)
-        self.tab_modes = ttk.Frame(nb)
-        self.tab_sweep = ttk.Frame(nb)
-        self.tab_manual = ttk.Frame(nb)
-        self.tab_mapping = ttk.Frame(nb)
+        self.tab_modes    = ttk.Frame(nb)
+        self.tab_sweep    = ttk.Frame(nb)
+        self.tab_manual   = ttk.Frame(nb)
+        self.tab_mapping  = ttk.Frame(nb)
+        self.tab_liveview = ttk.Frame(nb)
 
-        nb.add(self.tab_conn, text="1) Connection")
-        nb.add(self.tab_profiles, text="2) Plant Profiles")
-        nb.add(self.tab_modes, text="3) Modes")
-        nb.add(self.tab_sweep, text="4) Sweep + Speed")
-        nb.add(self.tab_manual, text="5) Manual Move")
-        nb.add(self.tab_mapping, text="6) Height Mapping")
+        nb.add(self.tab_conn,     text=" ⚙  Connection ")
+        nb.add(self.tab_profiles, text=" 🌿 Profiles ")
+        nb.add(self.tab_modes,    text=" 🎯 Mode ")
+        nb.add(self.tab_sweep,    text=" 🔄 Sweep ")
+        nb.add(self.tab_manual,   text=" 🤖 Manual ")
+        nb.add(self.tab_mapping,  text=" 📐 Mapping ")
+        nb.add(self.tab_liveview, text=" 📷 Live View ")
 
         self._build_tab_conn()
         self._build_tab_profiles()
@@ -630,437 +539,406 @@ class App(ttk.Frame):
         self._build_tab_sweep()
         self._build_tab_manual()
         self._build_tab_mapping()
+        self._build_tab_liveview()
 
-        # bottom bar
-        bar = ttk.Frame(left)
-        bar.pack(fill=tk.X, pady=(10, 0))
+        # ── Bottom bar (START / ABORT / progress) ────────────
+        bbar = ttk.Frame(left)
+        bbar.pack(fill=tk.X, padx=12, pady=10)
 
-        self.btn_start = ttk.Button(bar, text="▶ START", command=self.on_start)
-        self.btn_abort = ttk.Button(bar, text="■ ABORT", command=self.on_abort, state="disabled")
-        self.btn_start.pack(side=tk.LEFT, padx=(0, 8))
-        self.btn_abort.pack(side=tk.LEFT)
+        self.btn_start = ttk.Button(bbar, text="▶  START SCAN", style="Accent.TButton",
+                                    command=self.on_start)
+        self.btn_abort = ttk.Button(bbar, text="■  ABORT",      style="Danger.TButton",
+                                    command=self.on_abort, state="disabled")
+        self.btn_start.pack(side=tk.LEFT)
+        self.btn_abort.pack(side=tk.LEFT, padx=(10,0))
 
-        self.progress = ttk.Progressbar(bar, orient=tk.HORIZONTAL, mode="determinate", length=280)
-        self.progress.pack(side=tk.RIGHT, padx=(8, 0))
-        self.lbl_prog = ttk.Label(bar, text="Idle")
-        self.lbl_prog.pack(side=tk.RIGHT)
+        self.lbl_prog = ttk.Label(bbar, text="Idle", foreground=THEMES["dark"]["text2"])
+        self.lbl_prog.pack(side=tk.RIGHT, padx=(0,8))
+        self.progress = ttk.Progressbar(bbar, orient=tk.HORIZONTAL,
+                                        mode="determinate", length=260)
+        self.progress.pack(side=tk.RIGHT, padx=(0,10))
 
-        # logs
-        ttk.Label(right, text="Live Log", font=("Arial", 14, "bold")).pack(anchor="w")
-        frame = ttk.Frame(right)
-        frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        # ── Right panel: log ──────────────────────────────────
+        rpad = ttk.Frame(right)
+        rpad.pack(fill=tk.BOTH, expand=True, padx=(4,12), pady=8)
 
-        self.txt = tk.Text(frame, wrap="word")
+        log_hdr = ttk.Frame(rpad)
+        log_hdr.pack(fill=tk.X, pady=(0,6))
+        ttk.Label(log_hdr, text="Live Log", font=("Segoe UI",13,"bold")).pack(side=tk.LEFT)
+        ttk.Button(log_hdr, text="Clear", command=lambda: (self.txt.configure(state="normal"),
+                   self.txt.delete("1.0","end"), self.txt.configure(state="disabled"))).pack(side=tk.RIGHT)
+        ttk.Button(log_hdr, text="Save…", command=self.save_log).pack(side=tk.RIGHT, padx=6)
+
+        tf = ttk.Frame(rpad)
+        tf.pack(fill=tk.BOTH, expand=True)
+        self.txt = tk.Text(tf, wrap="word", state="disabled", relief="flat",
+                           font=("Consolas",9), bd=0)
         self.txt.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sc = ttk.Scrollbar(tf, orient=tk.VERTICAL, command=self.txt.yview)
+        sc.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt.configure(yscrollcommand=sc.set)
 
-        scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.txt.yview)
-        scroll.pack(side=tk.RIGHT, fill=tk.Y)
-        self.txt.configure(yscrollcommand=scroll.set)
+        cfgb = ttk.Frame(rpad)
+        cfgb.pack(fill=tk.X, pady=(8,0))
+        ttk.Button(cfgb, text="Load config…", command=self.load_config).pack(side=tk.LEFT)
+        ttk.Button(cfgb, text="Save config…", command=self.save_config).pack(side=tk.LEFT, padx=8)
 
-        bottom = ttk.Frame(right)
-        bottom.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(bottom, text="Clear log", command=lambda: self.txt.delete("1.0", "end")).pack(side=tk.LEFT)
-        ttk.Button(bottom, text="Save log…", command=self.save_log).pack(side=tk.LEFT, padx=8)
+    # ── helper to make a labelled group ──────────────────────
+    def _group(self, parent, title, pady=(10,6)):
+        lf = ttk.LabelFrame(parent, text=f"  {title}  ", padding=12)
+        lf.pack(fill=tk.X, padx=12, pady=pady)
+        return lf
 
-        cfgb = ttk.Frame(right)
-        cfgb.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(cfgb, text="Load full config JSON…", command=self.load_config).pack(side=tk.LEFT)
-        ttk.Button(cfgb, text="Save full config JSON…", command=self.save_config).pack(side=tk.LEFT, padx=8)
+    def _row(self, grid, r, label, var, c=0, width=None):
+        ttk.Label(grid, text=label).grid(row=r, column=c, sticky="w", padx=(0,8), pady=5)
+        kw = {"textvariable": var}
+        if width: kw["width"] = width
+        ttk.Entry(grid, **kw).grid(row=r, column=c+1, sticky="ew", pady=5, padx=(0,12))
 
-    # ---------- config I/O ----------
-    def save_config(self):
-        self._sync_cfg_from_ui()
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.cfg, f, indent=2)
-        messagebox.showinfo("Saved", "Config saved:\n{}".format(path))
-
-    def load_config(self):
-        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                self.cfg = json.load(f)
-            self._sync_ui_from_cfg()
-            self._ensure_active_profile()
-            messagebox.showinfo("Loaded", "Config loaded:\n{}".format(path))
-        except Exception as e:
-            messagebox.showerror("Load error", str(e))
-
-    def save_log(self):
-        path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text", "*.txt")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(self.txt.get("1.0", "end"))
-        messagebox.showinfo("Saved", "Log saved:\n{}".format(path))
-
-    # ---------- PROFILES JSON (NEW) ----------
-    def export_profiles_json(self):
-        self._sync_cfg_from_ui()
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
-        if not path:
-            return
-        payload = {
-            "active_profile": self.cfg.get("active_profile", ""),
-            "profiles": self.cfg.get("profiles", []),
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2)
-        self.log("Exported profiles JSON: {}".format(path))
-        messagebox.showinfo("Profiles saved", "Profiles saved:\n{}".format(path))
-
-    def import_profiles_json(self):
-        path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
-        if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            if isinstance(payload, dict) and "profiles" in payload:
-                self.cfg["profiles"] = payload.get("profiles", [])
-                if payload.get("active_profile"):
-                    self.cfg["active_profile"] = payload.get("active_profile", "")
-            elif isinstance(payload, list):
-                # allow simple list-of-profiles JSON
-                self.cfg["profiles"] = payload
-            else:
-                raise ValueError("Invalid profiles JSON format.")
-            self.refresh_profiles_dropdown()
-            self._ensure_active_profile()
-            self._sync_ui_from_cfg_profiles_only()
-            self.log("Imported profiles JSON: {}".format(path))
-            messagebox.showinfo("Profiles loaded", "Profiles loaded:\n{}".format(path))
-        except Exception as e:
-            messagebox.showerror("Import error", str(e))
-
-    # ---------- tabs ----------
+    # ── Tab 1: Connection ─────────────────────────────────────
     def _build_tab_conn(self):
-        box = ttk.LabelFrame(self.tab_conn, text="Robot Wi-Fi + URL")
-        box.pack(fill=tk.X, padx=10, pady=10)
+        # Robot group
+        g = self._group(self.tab_conn, "Robot Wi-Fi + URL")
+        g.columnconfigure(1, weight=1); g.columnconfigure(3, weight=1)
 
         self.var_ssid = tk.StringVar(value=self.cfg["robot_ssid"])
         self.var_pass = tk.StringVar(value=self.cfg["robot_pass"])
         self.var_base = tk.StringVar(value=self.cfg["robot_base"])
 
-        g = ttk.Frame(box)
-        g.pack(fill=tk.X, padx=10, pady=10)
-        g.columnconfigure(1, weight=1)
+        self._row(g, 0, "SSID:",     self.var_ssid, 0)
+        self._row(g, 0, "Robot URL:",self.var_base, 2)
+        ttk.Label(g, text="Password:").grid(row=1, column=0, sticky="w", padx=(0,8), pady=5)
+        ttk.Entry(g, textvariable=self.var_pass, show="*").grid(row=1, column=1, sticky="ew", pady=5, padx=(0,12))
 
-        ttk.Label(g, text="Robot SSID:").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Entry(g, textvariable=self.var_ssid).grid(row=0, column=1, sticky="ew", pady=4)
-        ttk.Label(g, text="Robot password:").grid(row=1, column=0, sticky="w", pady=4)
-        ttk.Entry(g, textvariable=self.var_pass, show="*").grid(row=1, column=1, sticky="ew", pady=4)
-        ttk.Label(g, text="Robot URL:").grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Entry(g, textvariable=self.var_base).grid(row=2, column=1, sticky="ew", pady=4)
+        if _IS_WINDOWS:
+            ttk.Label(g, text="ℹ  Windows: connect to robot Wi-Fi from taskbar",
+                      foreground=THEMES["dark"]["text2"],
+                      font=("Segoe UI",9)).grid(row=2, column=0, columnspan=4, sticky="w", pady=(0,4))
 
-        b = ttk.Frame(box)
-        b.pack(fill=tk.X, padx=10, pady=(0, 10))
-        ttk.Button(b, text="Connect Wi-Fi", command=self.on_connect_wifi).pack(side=tk.LEFT)
-        ttk.Button(b, text="Test Robot", command=self.on_test_robot).pack(side=tk.LEFT, padx=8)
-        ttk.Button(b, text="Read Angles", command=self.on_read_angles).pack(side=tk.LEFT, padx=8)
+        bb = ttk.Frame(g); bb.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4,0))
+        if not _IS_WINDOWS:
+            ttk.Button(bb, text="Connect Wi-Fi", command=self.on_connect_wifi).pack(side=tk.LEFT)
+        ttk.Button(bb, text="Test Robot",  command=self.on_test_robot).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bb, text="Read Angles", command=self.on_read_angles).pack(side=tk.LEFT)
 
-        box2 = ttk.LabelFrame(self.tab_conn, text="Raspberry Pi (Cameras)")
-        box2.pack(fill=tk.X, padx=10, pady=(0, 10))
+        # Pi group
+        g2 = self._group(self.tab_conn, "Raspberry Pi — HTTP (port 8765)")
+        g2.columnconfigure(1, weight=1); g2.columnconfigure(3, weight=1)
 
         self.var_use_cam = tk.BooleanVar(value=self.cfg["use_cameras"])
-        self.var_rot180 = tk.BooleanVar(value=self.cfg["rotate_180"])
+        self.var_rot180  = tk.BooleanVar(value=self.cfg["rotate_180"])
         self.var_pi_host = tk.StringVar(value=self.cfg["pi_host"])
-        self.var_pi_port = tk.StringVar(value=str(self.cfg.get("pi_ssh_port", 22)))
-        self.var_pi_user = tk.StringVar(value=self.cfg["pi_user"])
-        self.var_pi_cap = tk.StringVar(value=self.cfg["pi_capture"])
+        self.var_pi_port = tk.StringVar(value=str(self.cfg.get("pi_port", 8765)))
 
-        g2 = ttk.Frame(box2)
-        g2.pack(fill=tk.X, padx=10, pady=10)
-        g2.columnconfigure(1, weight=1)
+        ttk.Checkbutton(g2, text="Trigger USB webcam during scan",
+                        variable=self.var_use_cam).grid(row=0, column=0, columnspan=2, sticky="w", pady=4)
+        ttk.Checkbutton(g2, text="Rotate images 180° (upside-down mount)",
+                        variable=self.var_rot180).grid(row=1, column=0, columnspan=2, sticky="w", pady=4)
+        self._row(g2, 2, "Pi IP:",   self.var_pi_host, 0)
+        self._row(g2, 2, "HTTP port:",self.var_pi_port, 2, width=8)
 
-        ttk.Checkbutton(g2, text="Trigger Pi cameras during scan", variable=self.var_use_cam)\
-            .grid(row=0, column=0, columnspan=2, sticky="w", pady=6)
-        ttk.Checkbutton(g2, text="Rotate saved images 180° (robot upside down)", variable=self.var_rot180)\
-            .grid(row=1, column=0, columnspan=2, sticky="w", pady=6)
+        bb2 = ttk.Frame(g2); bb2.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6,0))
+        ttk.Button(bb2, text="Test Pi server",        command=self.on_test_pi).pack(side=tk.LEFT)
+        ttk.Button(bb2, text="Test capture",          command=self.on_test_capture).pack(side=tk.LEFT, padx=8)
+        ttk.Button(bb2, text="🌐 Browse images",      command=self.open_browser).pack(side=tk.LEFT)
 
-        ttk.Label(g2, text="Pi IP:").grid(row=2, column=0, sticky="w", pady=4)
-        ttk.Entry(g2, textvariable=self.var_pi_host).grid(row=2, column=1, sticky="ew", pady=4)
-        ttk.Label(g2, text="Pi SSH port:").grid(row=3, column=0, sticky="w", pady=4)
-        ttk.Entry(g2, textvariable=self.var_pi_port, width=8).grid(row=3, column=1, sticky="w", pady=4)
-        ttk.Label(g2, text="Pi user:").grid(row=4, column=0, sticky="w", pady=4)
-        ttk.Entry(g2, textvariable=self.var_pi_user).grid(row=4, column=1, sticky="ew", pady=4)
-        ttk.Label(g2, text="capture_dual.py path:").grid(row=5, column=0, sticky="w", pady=4)
-        ttk.Entry(g2, textvariable=self.var_pi_cap).grid(row=5, column=1, sticky="ew", pady=4)
+        # Storage info
+        g3 = self._group(self.tab_conn, "Image Storage")
+        ttk.Label(g3, text="Images save to Pi SD card by default (/home/umap/captures/).\n"
+                           "If USB drive is plugged in, USB is used instead.\n"
+                           "Access images via browser: http://192.168.4.20:8765/browse",
+                  font=("Segoe UI",9), foreground=THEMES["dark"]["text2"],
+                  justify="left").pack(anchor="w")
 
-        bb = ttk.Frame(box2)
-        bb.pack(fill=tk.X, padx=10, pady=(0, 10))
-        ttk.Button(bb, text="Test Pi (ping + USB)", command=self.on_test_pi).pack(side=tk.LEFT)
-        ttk.Button(bb, text="Test capture (save to USB)", command=self.on_test_capture).pack(side=tk.LEFT, padx=8)
-
+    # ── Tab 2: Profiles ───────────────────────────────────────
     def _build_tab_profiles(self):
-        box = ttk.LabelFrame(self.tab_profiles, text="Plant Profiles (create your own + save/load profiles JSON)")
-        box.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        # selection row
-        top = ttk.Frame(box)
-        top.pack(fill=tk.X, padx=10, pady=(10, 6))
+        top = ttk.Frame(self.tab_profiles); top.pack(fill=tk.X, padx=12, pady=(12,0))
 
         self.var_profile = tk.StringVar()
-        self.cmb_profile = ttk.Combobox(top, textvariable=self.var_profile, state="readonly", width=24)
+        self.cmb_profile = ttk.Combobox(top, textvariable=self.var_profile,
+                                        state="readonly", width=22, font=("Segoe UI",10))
         self.cmb_profile.pack(side=tk.LEFT)
+        ttk.Button(top, text="+ Add",    command=self.add_profile).pack(side=tk.LEFT, padx=(10,4))
+        ttk.Button(top, text="✕ Delete", command=self.delete_profile).pack(side=tk.LEFT)
 
-        ttk.Button(top, text="Refresh list", command=self.refresh_profiles_dropdown).pack(side=tk.LEFT, padx=8)
-        ttk.Button(top, text="Add profile", command=self.add_profile).pack(side=tk.LEFT, padx=8)
-        ttk.Button(top, text="Delete profile", command=self.delete_profile).pack(side=tk.LEFT, padx=8)
+        # Active profile banner
+        ab = ttk.Frame(self.tab_profiles); ab.pack(fill=tk.X, padx=12, pady=8)
+        ttk.Label(ab, text="Active for scan:", font=("Segoe UI",10,"bold")).pack(side=tk.LEFT)
+        self.var_active_profile = tk.StringVar(value=self.cfg.get("active_profile",""))
+        ttk.Entry(ab, textvariable=self.var_active_profile, state="readonly", width=22,
+                  font=("Segoe UI",10)).pack(side=tk.LEFT, padx=8)
+        ttk.Button(ab, text="✅ Set selected as active",
+                   command=self.set_selected_as_active_profile,
+                   style="Accent.TButton").pack(side=tk.LEFT)
 
-        ttk.Separator(box).pack(fill=tk.X, padx=10, pady=8)
+        pj = ttk.Frame(self.tab_profiles); pj.pack(fill=tk.X, padx=12, pady=(0,6))
+        ttk.Button(pj, text="⬆ Export JSON", command=self.export_profiles_json).pack(side=tk.LEFT)
+        ttk.Button(pj, text="⬇ Import JSON", command=self.import_profiles_json).pack(side=tk.LEFT, padx=8)
 
-        # Active profile row (NEW)
-        ap = ttk.Frame(box)
-        ap.pack(fill=tk.X, padx=10, pady=(0, 8))
-        ttk.Label(ap, text="Active profile used for scan:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
-        self.var_active_profile = tk.StringVar(value=self.cfg.get("active_profile", ""))
-        self.ent_active = ttk.Entry(ap, textvariable=self.var_active_profile, state="readonly", width=28)
-        self.ent_active.pack(side=tk.LEFT, padx=8)
-        ttk.Button(ap, text="Use selected profile for scan ✅", command=self.set_selected_as_active_profile)\
-            .pack(side=tk.LEFT, padx=8)
+        ttk.Separator(self.tab_profiles).pack(fill=tk.X, padx=12, pady=4)
 
-        # Export/Import profiles JSON (NEW)
-        pj = ttk.Frame(box)
-        pj.pack(fill=tk.X, padx=10, pady=(0, 10))
-        ttk.Button(pj, text="Export PROFILES to JSON…", command=self.export_profiles_json).pack(side=tk.LEFT)
-        ttk.Button(pj, text="Import PROFILES from JSON…", command=self.import_profiles_json).pack(side=tk.LEFT, padx=8)
+        # Editor
+        g = self._group(self.tab_profiles, "Profile Editor")
+        g.columnconfigure(1, weight=1); g.columnconfigure(3, weight=1)
 
-        # editor
-        edit = ttk.Frame(box)
-        edit.pack(fill=tk.X, padx=10, pady=10)
-        edit.columnconfigure(1, weight=1)
-        edit.columnconfigure(3, weight=1)
-
-        self.var_p_name = tk.StringVar(value="")
-        self.var_p_h = tk.DoubleVar(value=20.0)
-        self.var_p_w = tk.DoubleVar(value=30.0)
-        self.var_p_c = tk.DoubleVar(value=5.0)
+        self.var_p_name   = tk.StringVar()
+        self.var_p_h      = tk.DoubleVar(value=20.0)
+        self.var_p_w      = tk.DoubleVar(value=30.0)
+        self.var_p_c      = tk.DoubleVar(value=5.0)
         self.var_p_manual = tk.BooleanVar(value=True)
 
-        def row(r, label, var, c):
-            ttk.Label(edit, text=label).grid(row=r, column=c, sticky="w", padx=(0, 6), pady=6)
-            ttk.Entry(edit, textvariable=var).grid(row=r, column=c + 1, sticky="ew", pady=6)
+        self._row(g, 0, "Name:",         self.var_p_name, 0)
+        self._row(g, 0, "Height (cm):",  self.var_p_h,    2)
+        self._row(g, 1, "Width (cm):",   self.var_p_w,    0)
+        self._row(g, 1, "Clearance (cm):",self.var_p_c,   2)
+        ttk.Checkbutton(g, text="Use manual rings", variable=self.var_p_manual)\
+            .grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
 
-        row(0, "Profile name:", self.var_p_name, 0)
-        row(0, "Height (cm):", self.var_p_h, 2)
-        row(1, "Width (cm):", self.var_p_w, 0)
-        row(1, "Clearance (cm):", self.var_p_c, 2)
+        # Rings
+        rg = self._group(self.tab_profiles, "Manual Rings (S = shoulder, E = elbow)")
+        rg.columnconfigure((0,1,2,3,4,5), weight=1)
 
-        ttk.Checkbutton(edit, text="Use MANUAL rings (recommended for your setup)", variable=self.var_p_manual)\
-            .grid(row=2, column=0, columnspan=2, sticky="w", pady=6)
+        self.var_r1s=tk.DoubleVar(value=-84); self.var_r1e=tk.DoubleVar(value=92)
+        self.var_r2s=tk.DoubleVar(value=-74); self.var_r2e=tk.DoubleVar(value=82)
+        self.var_r3s=tk.DoubleVar(value=-64); self.var_r3e=tk.DoubleVar(value=72)
 
-        rings = ttk.LabelFrame(box, text="Manual rings (3 rings: shoulder + elbow)")
-        rings.pack(fill=tk.X, padx=10, pady=(0, 10))
-        rr = ttk.Frame(rings)
-        rr.pack(fill=tk.X, padx=10, pady=10)
+        for col, (title, vs, ve) in enumerate([
+            ("Ring 1", self.var_r1s, self.var_r1e),
+            ("Ring 2", self.var_r2s, self.var_r2e),
+            ("Ring 3", self.var_r3s, self.var_r3e)]):
+            ttk.Label(rg, text=title, font=("Segoe UI",9,"bold")).grid(row=0, column=col*2, columnspan=2, pady=(0,4))
+            ttk.Label(rg, text="S:").grid(row=1, column=col*2, sticky="e", padx=(0,4))
+            ttk.Entry(rg, textvariable=vs, width=7).grid(row=1, column=col*2+1, sticky="w", pady=3)
+            ttk.Label(rg, text="E:").grid(row=2, column=col*2, sticky="e", padx=(0,4))
+            ttk.Entry(rg, textvariable=ve, width=7).grid(row=2, column=col*2+1, sticky="w", pady=3)
 
-        self.var_r1s = tk.DoubleVar(value=-84.0); self.var_r1e = tk.DoubleVar(value=92.0)
-        self.var_r2s = tk.DoubleVar(value=-74.0); self.var_r2e = tk.DoubleVar(value=82.0)
-        self.var_r3s = tk.DoubleVar(value=-64.0); self.var_r3e = tk.DoubleVar(value=72.0)
+        btns = ttk.Frame(self.tab_profiles); btns.pack(fill=tk.X, padx=12, pady=6)
+        ttk.Button(btns, text="Load → editor", command=self.load_selected_profile_to_editor).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Save → profile", command=self.save_editor_to_selected_profile).pack(side=tk.LEFT, padx=8)
+        ttk.Button(btns, text="Preview rings", command=self.preview_profile_rings).pack(side=tk.LEFT)
 
-        def rbox(col, title, vs, ve):
-            f = ttk.Frame(rr)
-            f.grid(row=0, column=col, sticky="ew", padx=10)
-            ttk.Label(f, text=title, font=("Arial", 10, "bold")).pack(anchor="w")
-            line = ttk.Frame(f); line.pack(fill=tk.X, pady=4)
-            ttk.Label(line, text="S:").pack(side=tk.LEFT)
-            ttk.Entry(line, textvariable=vs, width=8).pack(side=tk.LEFT, padx=4)
-            ttk.Label(line, text="E:").pack(side=tk.LEFT, padx=(8, 0))
-            ttk.Entry(line, textvariable=ve, width=8).pack(side=tk.LEFT, padx=4)
-
-        rbox(0, "Ring1", self.var_r1s, self.var_r1e)
-        rbox(1, "Ring2", self.var_r2s, self.var_r2e)
-        rbox(2, "Ring3", self.var_r3s, self.var_r3e)
-
-        btns = ttk.Frame(box)
-        btns.pack(fill=tk.X, padx=10, pady=(0, 10))
-        ttk.Button(btns, text="Load selected → editor", command=self.load_selected_profile_to_editor).pack(side=tk.LEFT)
-        ttk.Button(btns, text="Save editor → selected", command=self.save_editor_to_selected_profile).pack(side=tk.LEFT, padx=8)
-        ttk.Button(btns, text="Preview rings (log)", command=self.preview_profile_rings).pack(side=tk.LEFT, padx=8)
-
-        # Hook selection change: load profile into editor (and optionally set active)
-        self.cmb_profile.bind("<<ComboboxSelected>>", self.on_profile_selected)
-
+        self.cmb_profile.bind("<<ComboboxSelected>>", lambda *_: self.load_selected_profile_to_editor())
         self.refresh_profiles_dropdown()
         if self.cmb_profile["values"]:
             self.var_profile.set(self.cmb_profile["values"][0])
             self.load_selected_profile_to_editor()
 
+    # ── Tab 3: Modes ─────────────────────────────────────────
     def _build_tab_modes(self):
-        box = ttk.LabelFrame(self.tab_modes, text="Modes (select profile first, then Start)")
-        box.pack(fill=tk.X, padx=10, pady=10)
+        g = self._group(self.tab_modes, "Scan Mode")
+        g.columnconfigure(1, weight=1)
 
-        self.var_mode = tk.StringVar(value=self.cfg["mode"])
-        self.var_testname = tk.StringVar(value="test1")
+        self.var_mode         = tk.StringVar(value=self.cfg["mode"])
+        self.var_testname     = tk.StringVar(value="test1")
         self.var_final_images = tk.IntVar(value=self.cfg["final_total_images"])
-        self.var_test_images = tk.IntVar(value=self.cfg["test_total_images"])
+        self.var_test_images  = tk.IntVar(value=self.cfg["test_total_images"])
 
-        g = ttk.Frame(box); g.pack(fill=tk.X, padx=10, pady=10)
-        g.columnconfigure(1, weight=1)
-
-        ttk.Label(g, text="Mode:").grid(row=0, column=0, sticky="w", pady=6)
+        ttk.Label(g, text="Mode:").grid(row=0, column=0, sticky="w", padx=(0,8), pady=6)
         ttk.Combobox(g, textvariable=self.var_mode, state="readonly",
-                     values=["Calibration", "Test", "Final"]).grid(row=0, column=1, sticky="ew", pady=6)
+                     values=["Calibration","Test","Final"],
+                     font=("Segoe UI",10)).grid(row=0, column=1, sticky="ew", pady=6)
+        self._row(g, 1, "Test name:",    self.var_testname,     0)
+        self._row(g, 2, "Test images:",  self.var_test_images,  0)
+        self._row(g, 3, "Final images:", self.var_final_images, 0)
 
-        ttk.Label(g, text="Test name:").grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Entry(g, textvariable=self.var_testname).grid(row=1, column=1, sticky="ew", pady=6)
+        ap = ttk.Frame(g); ap.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8,0))
+        ttk.Label(ap, text="Active profile:", font=("Segoe UI",10,"bold")).pack(side=tk.LEFT)
+        ttk.Entry(ap, textvariable=self.var_active_profile, state="readonly",
+                  width=22, font=("Segoe UI",10)).pack(side=tk.LEFT, padx=8)
 
-        ttk.Label(g, text="Test images (Test mode):").grid(row=2, column=0, sticky="w", pady=6)
-        ttk.Entry(g, textvariable=self.var_test_images).grid(row=2, column=1, sticky="ew", pady=6)
-
-        ttk.Label(g, text="Final images (Final mode):").grid(row=3, column=0, sticky="w", pady=6)
-        ttk.Entry(g, textvariable=self.var_final_images).grid(row=3, column=1, sticky="ew", pady=6)
-
-        ap = ttk.Frame(box)
-        ap.pack(fill=tk.X, padx=10, pady=(0, 10))
-        ttk.Label(ap, text="Active profile for scan:", font=("Arial", 10, "bold")).pack(side=tk.LEFT)
-        self.ent_active2 = ttk.Entry(ap, textvariable=self.var_active_profile, state="readonly", width=28)
-        self.ent_active2.pack(side=tk.LEFT, padx=8)
-        ttk.Label(ap, text="(set it in Plant Profiles tab)", foreground="#444").pack(side=tk.LEFT)
-
+    # ── Tab 4: Sweep ─────────────────────────────────────────
     def _build_tab_sweep(self):
-        box = ttk.LabelFrame(self.tab_sweep, text="Sweep + speed")
-        box.pack(fill=tk.X, padx=10, pady=10)
+        g = self._group(self.tab_sweep, "Sweep + Speed")
+        g.columnconfigure(1, weight=1); g.columnconfigure(3, weight=1)
 
-        self.var_spd = tk.IntVar(value=self.cfg["spd"])
-        self.var_acc = tk.IntVar(value=self.cfg["acc"])
-        self.var_delay = tk.DoubleVar(value=self.cfg["delay_s"])
-        self.var_hold = tk.BooleanVar(value=self.cfg["hold_last_pose"])
+        self.var_spd        = tk.IntVar(value=self.cfg["spd"])
+        self.var_acc        = tk.IntVar(value=self.cfg["acc"])
+        self.var_delay      = tk.DoubleVar(value=self.cfg["delay_s"])
+        self.var_hold       = tk.BooleanVar(value=self.cfg["hold_last_pose"])
+        self.var_base_center= tk.DoubleVar(value=self.cfg["base_center_deg"])
+        self.var_base_half  = tk.DoubleVar(value=self.cfg["base_half_span_deg"])
+        self.var_safe_lim   = tk.DoubleVar(value=self.cfg["safe_limit_deg"])
+        self.var_hand_lock  = tk.DoubleVar(value=self.cfg["lock_hand_deg"])
 
-        self.var_base_center = tk.DoubleVar(value=self.cfg["base_center_deg"])
-        self.var_base_half = tk.DoubleVar(value=self.cfg["base_half_span_deg"])
-        self.var_safe_lim = tk.DoubleVar(value=self.cfg["safe_limit_deg"])
-        self.var_hand_lock = tk.DoubleVar(value=self.cfg["lock_hand_deg"])
+        self._row(g, 0, "Speed:",      self.var_spd,          0)
+        self._row(g, 0, "Accel:",      self.var_acc,          2)
+        self._row(g, 1, "Delay (s):",  self.var_delay,        0)
+        self._row(g, 2, "Base center (°):", self.var_base_center, 0)
+        self._row(g, 2, "Half span (°):",   self.var_base_half,   2)
+        self._row(g, 3, "Safety limit (°):",self.var_safe_lim,    0)
+        self._row(g, 3, "Hand lock (°):",   self.var_hand_lock,   2)
+        ttk.Checkbutton(g, text="Hold last pose (torque ON)",
+                        variable=self.var_hold).grid(row=1, column=2, columnspan=2, sticky="w", pady=5)
 
-        g = ttk.Frame(box)
-        g.pack(fill=tk.X, padx=10, pady=10)
-        g.columnconfigure(1, weight=1)
-        g.columnconfigure(3, weight=1)
-
-        def row(r, label, var, c):
-            ttk.Label(g, text=label).grid(row=r, column=c, sticky="w", padx=(0, 6), pady=6)
-            ttk.Entry(g, textvariable=var).grid(row=r, column=c + 1, sticky="ew", pady=6)
-
-        row(0, "Speed spd:", self.var_spd, 0)
-        row(0, "Accel acc:", self.var_acc, 2)
-        row(1, "Delay (sec):", self.var_delay, 0)
-        ttk.Checkbutton(g, text="Hold last pose (keep torque ON)", variable=self.var_hold)\
-            .grid(row=1, column=2, columnspan=2, sticky="w", pady=6)
-
-        row(2, "Base center (°):", self.var_base_center, 0)
-        row(2, "Half span (°):", self.var_base_half, 2)
-        row(3, "Safety limit (°):", self.var_safe_lim, 0)
-        row(3, "Hand lock (°):", self.var_hand_lock, 2)
-
-        p = ttk.Frame(box)
-        p.pack(fill=tk.X, padx=10, pady=(0, 10))
-        ttk.Label(p, text="Quick speed:").pack(side=tk.LEFT)
-        ttk.Button(p, text="Slow", command=lambda: self.set_speed(10, 10, 0.60)).pack(side=tk.LEFT, padx=6)
-        ttk.Button(p, text="Normal", command=lambda: self.set_speed(20, 20, 0.30)).pack(side=tk.LEFT, padx=6)
-        ttk.Button(p, text="Fast", command=lambda: self.set_speed(30, 30, 0.15)).pack(side=tk.LEFT, padx=6)
+        sp = ttk.Frame(self.tab_sweep); sp.pack(fill=tk.X, padx=12, pady=(0,8))
+        ttk.Label(sp, text="Quick speed:", font=("Segoe UI",10)).pack(side=tk.LEFT)
+        for lbl, s,a,d in [("🐢 Slow",10,10,0.60),("🚶 Normal",20,20,0.30),("🏃 Fast",30,30,0.15)]:
+            ttk.Button(sp, text=lbl, command=lambda s=s,a=a,d=d: self.set_speed(s,a,d))\
+                .pack(side=tk.LEFT, padx=6)
 
     def set_speed(self, spd, acc, delay):
-        self.var_spd.set(int(spd))
-        self.var_acc.set(int(acc))
-        self.var_delay.set(float(delay))
-        self.log("Speed preset: spd={} acc={} delay={}s".format(spd, acc, delay))
+        self.var_spd.set(int(spd)); self.var_acc.set(int(acc)); self.var_delay.set(float(delay))
+        self.log(f"Speed: spd={spd} acc={acc} delay={delay}s")
 
+    # ── Tab 5: Manual ─────────────────────────────────────────
     def _build_tab_manual(self):
-        box = ttk.LabelFrame(self.tab_manual, text="Manual move (for framing check)")
-        box.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        g = self._group(self.tab_manual, "Manual Joint Control")
+        g.columnconfigure(1, weight=1)
 
         self.var_m_base = tk.DoubleVar(value=0.0)
-        self.var_m_s = tk.DoubleVar(value=-82.0)
-        self.var_m_e = tk.DoubleVar(value=90.0)
-        self.var_m_h = tk.DoubleVar(value=62.0)
+        self.var_m_s    = tk.DoubleVar(value=-82.0)
+        self.var_m_e    = tk.DoubleVar(value=90.0)
+        self.var_m_h    = tk.DoubleVar(value=62.0)
 
-        g = ttk.Frame(box)
-        g.pack(fill=tk.X, padx=10, pady=10)
-        g.columnconfigure(1, weight=1)
+        for row_i, (lbl, var, lo, hi) in enumerate([
+            ("Base",     self.var_m_base, -175, 175),
+            ("Shoulder", self.var_m_s,    -120, -30),
+            ("Elbow",    self.var_m_e,      20, 110),
+            ("Hand",     self.var_m_h,       0, 120)]):
 
-        def slider_row(row, label, var, lo, hi, step=1.0):
-            ttk.Label(g, text=label).grid(row=row, column=0, sticky="w", pady=6)
-            s = ttk.Scale(g, from_=lo, to=hi, variable=var)
-            s.grid(row=row, column=1, sticky="ew", pady=6)
-            v = ttk.Label(g, text="{:.1f}°".format(var.get()))
-            v.grid(row=row, column=2, sticky="e", padx=(8, 0))
+            ttk.Label(g, text=lbl, font=("Segoe UI",10,"bold")).grid(row=row_i, column=0, sticky="w", padx=(0,10), pady=8)
+            ttk.Scale(g, from_=lo, to=hi, variable=var, orient="horizontal")\
+                .grid(row=row_i, column=1, sticky="ew", pady=8)
+            val_lbl = ttk.Label(g, text=f"{var.get():.1f}°", width=7)
+            val_lbl.grid(row=row_i, column=2, padx=8)
+            var.trace_add("write", lambda *_, v=var, l=val_lbl: l.configure(text=f"{v.get():.1f}°"))
+            bb = ttk.Frame(g); bb.grid(row=row_i, column=3)
+            ttk.Button(bb, text="−", width=3, command=lambda v=var: v.set(v.get()-1)).pack(side=tk.LEFT)
+            ttk.Button(bb, text="+", width=3, command=lambda v=var: v.set(v.get()+1)).pack(side=tk.LEFT, padx=2)
 
-            def update_label(*_):
-                v.configure(text="{:.1f}°".format(var.get()))
-            var.trace_add("write", update_label)
+        btns = ttk.Frame(self.tab_manual); btns.pack(fill=tk.X, padx=12, pady=6)
+        ttk.Button(btns, text="Read → sliders", command=self.on_read_angles_to_sliders).pack(side=tk.LEFT)
+        ttk.Button(btns, text="▶ Move now", style="Accent.TButton",
+                   command=self.on_manual_move).pack(side=tk.LEFT, padx=8)
 
-            bb = ttk.Frame(g)
-            bb.grid(row=row, column=3, sticky="e", padx=(8, 0))
-            ttk.Button(bb, text="-", width=3, command=lambda: var.set(var.get() - step)).pack(side=tk.LEFT)
-            ttk.Button(bb, text="+", width=3, command=lambda: var.set(var.get() + step)).pack(side=tk.LEFT, padx=4)
-
-        slider_row(0, "Base", self.var_m_base, -175, 175, step=1.0)
-        slider_row(1, "Shoulder", self.var_m_s, -120, -30, step=1.0)
-        slider_row(2, "Elbow", self.var_m_e, 20, 110, step=1.0)
-        slider_row(3, "Hand", self.var_m_h, 0, 120, step=1.0)
-
-        bb = ttk.Frame(box)
-        bb.pack(fill=tk.X, padx=10, pady=(0, 10))
-        ttk.Button(bb, text="Read angles → sliders", command=self.on_read_angles_to_sliders).pack(side=tk.LEFT)
-        ttk.Button(bb, text="Move now", command=self.on_manual_move).pack(side=tk.LEFT, padx=8)
-
+    # ── Tab 6: Mapping ────────────────────────────────────────
     def _build_tab_mapping(self):
-        box = ttk.LabelFrame(self.tab_mapping, text="Height → Mid Pose mapping (Auto Rings)")
-        box.pack(fill=tk.X, padx=10, pady=10)
+        g = self._group(self.tab_mapping, "Height → Pose Mapping (Auto Rings)")
+        g.columnconfigure(1, weight=1); g.columnconfigure(3, weight=1)
 
-        self.var_h_low = tk.DoubleVar(value=self.cfg["height_low_cm"])
-        self.var_h_high = tk.DoubleVar(value=self.cfg["height_high_cm"])
-        self.var_s_low = tk.DoubleVar(value=self.cfg["pose_low_sh_deg"])
-        self.var_e_low = tk.DoubleVar(value=self.cfg["pose_low_el_deg"])
-        self.var_s_high = tk.DoubleVar(value=self.cfg["pose_high_sh_deg"])
-        self.var_e_high = tk.DoubleVar(value=self.cfg["pose_high_el_deg"])
-        self.var_span_h = tk.DoubleVar(value=self.cfg["ring_height_span_deg"])
-        self.var_span_w = tk.DoubleVar(value=self.cfg["ring_width_span_deg"])
+        self.var_h_low   = tk.DoubleVar(value=self.cfg["height_low_cm"])
+        self.var_h_high  = tk.DoubleVar(value=self.cfg["height_high_cm"])
+        self.var_s_low   = tk.DoubleVar(value=self.cfg["pose_low_sh_deg"])
+        self.var_e_low   = tk.DoubleVar(value=self.cfg["pose_low_el_deg"])
+        self.var_s_high  = tk.DoubleVar(value=self.cfg["pose_high_sh_deg"])
+        self.var_e_high  = tk.DoubleVar(value=self.cfg["pose_high_el_deg"])
+        self.var_span_h  = tk.DoubleVar(value=self.cfg["ring_height_span_deg"])
+        self.var_span_w  = tk.DoubleVar(value=self.cfg["ring_width_span_deg"])
         self.var_el_gain = tk.DoubleVar(value=self.cfg["elbow_push_gain"])
-        self.var_el_r0 = tk.DoubleVar(value=self.cfg["elbow_push_radius0_cm"])
+        self.var_el_r0   = tk.DoubleVar(value=self.cfg["elbow_push_radius0_cm"])
 
-        g = ttk.Frame(box)
-        g.pack(fill=tk.X, padx=10, pady=10)
-        g.columnconfigure(1, weight=1)
-        g.columnconfigure(3, weight=1)
+        pairs = [
+            ("Height low (cm):",        self.var_h_low,  "Height high (cm):",       self.var_h_high),
+            ("LOW Shoulder (°):",       self.var_s_low,  "LOW Elbow (°):",           self.var_e_low),
+            ("HIGH Shoulder (°):",      self.var_s_high, "HIGH Elbow (°):",          self.var_e_high),
+            ("Ring height span (°):",   self.var_span_h, "Ring width span (°):",     self.var_span_w),
+            ("Elbow push gain:",        self.var_el_gain,"Elbow radius0 (cm):",      self.var_el_r0),
+        ]
+        for i, (l1,v1,l2,v2) in enumerate(pairs):
+            self._row(g, i, l1, v1, 0)
+            self._row(g, i, l2, v2, 2)
 
-        def row(r, label, var, c):
-            ttk.Label(g, text=label).grid(row=r, column=c, sticky="w", padx=(0, 6), pady=6)
-            ttk.Entry(g, textvariable=var).grid(row=r, column=c + 1, sticky="ew", pady=6)
+        ttk.Button(self.tab_mapping, text="Preview auto rings for active profile",
+                   command=self.preview_auto_rings_for_active_profile)\
+            .pack(anchor="w", padx=12, pady=6)
 
-        row(0, "Height low (cm):", self.var_h_low, 0)
-        row(0, "Height high (cm):", self.var_h_high, 2)
-        row(1, "Pose LOW Shoulder:", self.var_s_low, 0)
-        row(1, "Pose LOW Elbow:", self.var_e_low, 2)
-        row(2, "Pose HIGH Shoulder:", self.var_s_high, 0)
-        row(2, "Pose HIGH Elbow:", self.var_e_high, 2)
-        row(3, "Ring height span (deg):", self.var_span_h, 0)
-        row(3, "Ring width span (deg):", self.var_span_w, 2)
-        row(4, "Elbow push gain (deg/cm):", self.var_el_gain, 0)
-        row(4, "Elbow push radius0 (cm):", self.var_el_r0, 2)
+    # ── Tab 7: Live View ──────────────────────────────────────
+    def _build_tab_liveview(self):
+        if not _PIL_OK:
+            f = ttk.Frame(self.tab_liveview); f.pack(expand=True)
+            ttk.Label(f, text="⚠  Live View requires Pillow",
+                      font=("Segoe UI",14,"bold")).pack(pady=(80,8))
+            ttk.Label(f, text="pip install Pillow", font=("Segoe UI",11)).pack()
+            return
 
-        ttk.Button(box, text="Preview AUTO rings for ACTIVE profile (log)", command=self.preview_auto_rings_for_active_profile)\
-            .pack(anchor="w", padx=10, pady=(0, 10))
+        ctrl = ttk.Frame(self.tab_liveview); ctrl.pack(fill=tk.X, padx=12, pady=10)
+        self.btn_lv = ttk.Button(ctrl, text="▶  Start Live View",
+                                 style="Accent.TButton", command=self.toggle_live_view)
+        self.btn_lv.pack(side=tk.LEFT)
+        self.lbl_lv_status = ttk.Label(ctrl, text="Stopped",
+                                       foreground=THEMES["dark"]["text2"],
+                                       font=("Segoe UI",10))
+        self.lbl_lv_status.pack(side=tk.LEFT, padx=15)
+        self.lbl_lv_fps = ttk.Label(ctrl, text="", font=("Segoe UI",10,"bold"))
+        self.lbl_lv_fps.pack(side=tk.RIGHT)
+        ttk.Label(ctrl, text="Stops automatically when scan starts",
+                  foreground=THEMES["dark"]["text2"],
+                  font=("Segoe UI",9)).pack(side=tk.RIGHT, padx=10)
 
-    # ---------- profile selection behavior ----------
-    def on_profile_selected(self, *_):
-        # Load into editor, but DO NOT auto-set active (user clicks button)
-        self.load_selected_profile_to_editor()
+        self.live_canvas = tk.Canvas(self.tab_liveview, bg="#0a0f1e",
+                                     relief="flat", bd=0)
+        self.live_canvas.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0,12))
+        self.live_canvas.create_text(320, 240,
+            text="Press  ▶ Start Live View  to see webcam feed",
+            fill="#334155", font=("Segoe UI",13), tags="placeholder")
 
+    def toggle_live_view(self):
+        if self._live_running: self._stop_live_view()
+        else:                  self._start_live_view()
+
+    def _start_live_view(self):
+        self._sync_cfg_from_ui()
+        if not self.cfg.get("pi_host","").strip():
+            messagebox.showerror("Live View","Set Pi IP in Connection tab first."); return
+        self._live_running = True
+        self.btn_lv.configure(text="■  Stop Live View")
+        self.lbl_lv_status.configure(text="Connecting…", foreground=THEMES["dark"]["warning"])
+        self._live_thread = threading.Thread(target=self._live_loop, daemon=True)
+        self._live_thread.start()
+
+    def _stop_live_view(self):
+        self._live_running = False
+        if hasattr(self,"btn_lv"):
+            self.btn_lv.configure(text="▶  Start Live View")
+        if hasattr(self,"lbl_lv_status"):
+            self.lbl_lv_status.configure(text="Stopped", foreground=self.T["text2"])
+        if hasattr(self,"lbl_lv_fps"):
+            self.lbl_lv_fps.configure(text="")
+
+    def _live_loop(self):
+        host = self.cfg.get("pi_host","")
+        port = int(self.cfg.get("pi_port",8765))
+        url  = f"http://{host}:{port}/preview"
+        frames = 0; t0 = time.time()
+        while self._live_running:
+            try:
+                r = requests.get(url, timeout=4)
+                if r.status_code==200 and r.headers.get("Content-Type","").startswith("image"):
+                    img = PILImage.open(io.BytesIO(r.content))
+                    frames += 1
+                    fps = frames / max(0.1, time.time()-t0)
+                    self.root.after(0, lambda i=img, f=fps: self._update_live_frame(i,f))
+                else:
+                    err = ""
+                    try: err = r.json().get("error","bad response")
+                    except: pass
+                    self.root.after(0, lambda e=err: self.lbl_lv_status.configure(
+                        text=f"Error: {e[:55]}", foreground=self.T["error"]))
+                    time.sleep(1); continue
+            except Exception as e:
+                self.root.after(0, lambda msg=str(e): self.lbl_lv_status.configure(
+                    text=f"Error: {msg[:55]}", foreground=self.T["error"]))
+                time.sleep(1); continue
+            time.sleep(0.4)
+
+    def _update_live_frame(self, img, fps):
+        if not _PIL_OK or not hasattr(self,"live_canvas"): return
+        cw = self.live_canvas.winfo_width()  or 640
+        ch = self.live_canvas.winfo_height() or 480
+        img.thumbnail((cw,ch), PILImage.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        self._live_photo = photo
+        self.live_canvas.delete("all")
+        self.live_canvas.create_image(cw//2, ch//2, anchor="center", image=photo)
+        self.lbl_lv_status.configure(text="● Live", foreground=self.T["success"])
+        self.lbl_lv_fps.configure(text=f"{fps:.1f} FPS")
+
+    # ── profile helpers ───────────────────────────────────────
     def _ensure_active_profile(self):
-        # If active_profile empty, pick first profile name
         if not self.cfg.get("active_profile"):
-            vals = [p.get("name", "") for p in self.cfg.get("profiles", []) if p.get("name")]
-            if vals:
-                self.cfg["active_profile"] = vals[0]
-        self.var_active_profile.set(self.cfg.get("active_profile", ""))
-
-        # ensure dropdown selection exists
+            vals = [p.get("name","") for p in self.cfg.get("profiles",[]) if p.get("name")]
+            if vals: self.cfg["active_profile"] = vals[0]
+        self.var_active_profile.set(self.cfg.get("active_profile",""))
         self.refresh_profiles_dropdown()
         if self.cfg.get("active_profile") in (self.cmb_profile["values"] or []):
             self.var_profile.set(self.cfg["active_profile"])
@@ -1069,229 +947,192 @@ class App(ttk.Frame):
     def set_selected_as_active_profile(self):
         self._sync_cfg_from_ui()
         name = self.var_profile.get().strip()
-        if not name:
-            messagebox.showerror("Profile", "Select a profile first.")
-            return
-        if not get_profile(self.cfg, name):
-            messagebox.showerror("Profile", "Selected profile not found.")
-            return
+        if not name or not get_profile(self.cfg, name):
+            messagebox.showerror("Profile","Select a valid profile first."); return
         self.cfg["active_profile"] = name
         self.var_active_profile.set(name)
-        self.log("Active profile set ✅: {}".format(name))
+        self.log(f"Active profile ✅: {name}")
 
-    # ---------- profile helpers ----------
     def refresh_profiles_dropdown(self):
-        names = [p.get("name", "Unnamed") for p in self.cfg.get("profiles", [])]
+        names = [p.get("name","?") for p in self.cfg.get("profiles",[])]
         self.cmb_profile["values"] = names
-        if names and (self.var_profile.get() not in names):
+        if names and self.var_profile.get() not in names:
             self.var_profile.set(names[0])
 
     def add_profile(self):
         self._sync_cfg_from_ui()
-        new_name = "Plant_{}".format(len(self.cfg.get("profiles", [])) + 1)
-        self.cfg.setdefault("profiles", []).append({
-            "name": new_name,
-            "height_cm": 20.0,
-            "width_cm": 30.0,
-            "clearance_cm": 5.0,
-            "use_manual_rings": True,
-            "manual_rings": [
-                {"s": -84.0, "e": 92.0},
-                {"s": -74.0, "e": 82.0},
-                {"s": -64.0, "e": 72.0},
-            ],
-        })
+        nm = f"Plant_{len(self.cfg.get('profiles',[]))+1}"
+        self.cfg.setdefault("profiles",[]).append({
+            "name":nm,"height_cm":20.0,"width_cm":30.0,"clearance_cm":5.0,
+            "use_manual_rings":True,
+            "manual_rings":[{"s":-84.0,"e":92.0},{"s":-74.0,"e":82.0},{"s":-64.0,"e":72.0}]})
         self.refresh_profiles_dropdown()
-        self.var_profile.set(new_name)
+        self.var_profile.set(nm)
         self.load_selected_profile_to_editor()
-        self.log("Added profile: {}".format(new_name))
+        self.log(f"Added profile: {nm}")
 
     def delete_profile(self):
         self._sync_cfg_from_ui()
         name = self.var_profile.get()
-        if not name:
-            return
-        profs = self.cfg.get("profiles", [])
-        profs2 = [p for p in profs if p.get("name") != name]
-        if len(profs2) == len(profs):
-            return
-        self.cfg["profiles"] = profs2
+        profs = [p for p in self.cfg.get("profiles",[]) if p.get("name")!=name]
+        if len(profs)==len(self.cfg.get("profiles",[])): return
+        self.cfg["profiles"] = profs
         self.refresh_profiles_dropdown()
         if self.cmb_profile["values"]:
             self.var_profile.set(self.cmb_profile["values"][0])
             self.load_selected_profile_to_editor()
-        # if deleted active profile, reselect
-        if self.cfg.get("active_profile") == name:
-            self.cfg["active_profile"] = ""
-            self._ensure_active_profile()
-        self.log("Deleted profile: {}".format(name))
+        if self.cfg.get("active_profile")==name:
+            self.cfg["active_profile"]=""; self._ensure_active_profile()
+        self.log(f"Deleted profile: {name}")
 
     def load_selected_profile_to_editor(self):
-        name = self.var_profile.get()
-        p = get_profile(self.cfg, name)
-        if not p:
-            return
-        self.var_p_name.set(p.get("name", ""))
-        self.var_p_h.set(float(p.get("height_cm", 20.0)))
-        self.var_p_w.set(float(p.get("width_cm", 30.0)))
-        self.var_p_c.set(float(p.get("clearance_cm", 5.0)))
-        self.var_p_manual.set(bool(p.get("use_manual_rings", True)))
-        mr = p.get("manual_rings", [])
-        if len(mr) >= 3:
-            self.var_r1s.set(float(mr[0].get("s", -84.0))); self.var_r1e.set(float(mr[0].get("e", 92.0)))
-            self.var_r2s.set(float(mr[1].get("s", -74.0))); self.var_r2e.set(float(mr[1].get("e", 82.0)))
-            self.var_r3s.set(float(mr[2].get("s", -64.0))); self.var_r3e.set(float(mr[2].get("e", 72.0)))
+        p = get_profile(self.cfg, self.var_profile.get())
+        if not p: return
+        self.var_p_name.set(p.get("name",""))
+        self.var_p_h.set(float(p.get("height_cm",20)))
+        self.var_p_w.set(float(p.get("width_cm",30)))
+        self.var_p_c.set(float(p.get("clearance_cm",5)))
+        self.var_p_manual.set(bool(p.get("use_manual_rings",True)))
+        mr = p.get("manual_rings",[])
+        if len(mr)>=3:
+            self.var_r1s.set(float(mr[0].get("s",-84))); self.var_r1e.set(float(mr[0].get("e",92)))
+            self.var_r2s.set(float(mr[1].get("s",-74))); self.var_r2e.set(float(mr[1].get("e",82)))
+            self.var_r3s.set(float(mr[2].get("s",-64))); self.var_r3e.set(float(mr[2].get("e",72)))
 
     def save_editor_to_selected_profile(self):
         self._sync_cfg_from_ui()
         name_sel = self.var_profile.get()
-        if not name_sel:
-            return
         p = get_profile(self.cfg, name_sel)
-        if not p:
-            return
+        if not p: return
         new_name = self.var_p_name.get().strip() or name_sel
-        p["name"] = new_name
-        p["height_cm"] = float(self.var_p_h.get())
-        p["width_cm"] = float(self.var_p_w.get())
-        p["clearance_cm"] = float(self.var_p_c.get())
-        p["use_manual_rings"] = bool(self.var_p_manual.get())
-        p["manual_rings"] = [
-            {"s": float(self.var_r1s.get()), "e": float(self.var_r1e.get())},
-            {"s": float(self.var_r2s.get()), "e": float(self.var_r2e.get())},
-            {"s": float(self.var_r3s.get()), "e": float(self.var_r3e.get())},
-        ]
+        p.update({"name":new_name,"height_cm":float(self.var_p_h.get()),
+                  "width_cm":float(self.var_p_w.get()),"clearance_cm":float(self.var_p_c.get()),
+                  "use_manual_rings":bool(self.var_p_manual.get()),
+                  "manual_rings":[{"s":float(self.var_r1s.get()),"e":float(self.var_r1e.get())},
+                                  {"s":float(self.var_r2s.get()),"e":float(self.var_r2e.get())},
+                                  {"s":float(self.var_r3s.get()),"e":float(self.var_r3e.get())}]})
         if new_name != name_sel:
             self.var_profile.set(new_name)
-            # also update active_profile if it was the old name
-            if self.cfg.get("active_profile") == name_sel:
-                self.cfg["active_profile"] = new_name
+            if self.cfg.get("active_profile")==name_sel:
+                self.cfg["active_profile"]=new_name
                 self.var_active_profile.set(new_name)
         self.refresh_profiles_dropdown()
-        self.log("Saved profile: {} (manual_rings={})".format(new_name, p["use_manual_rings"]))
+        self.log(f"Saved profile: {new_name}")
 
     def preview_profile_rings(self):
         self._sync_cfg_from_ui()
-        name = self.var_profile.get()
-        p = get_profile(self.cfg, name)
-        if not p:
-            return
-        rings, ws, ew, ee, rad, mid, used_auto = compute_rings_from_profile(self.cfg, p)
-        self.log("--- PROFILE RINGS PREVIEW ---")
-        self.log("Profile={} | H={} W={} clear={} | use_manual_rings={}".format(
-            p.get("name"), p.get("height_cm"), p.get("width_cm"), p.get("clearance_cm"), p.get("use_manual_rings", False)
-        ))
-        self.log("Used {} rings".format("AUTO" if used_auto else "MANUAL"))
-        self.log("Rings (S,E): " + " | ".join(["({:.1f},{:.1f})".format(s, e) for (s, e) in rings]))
+        p = get_profile(self.cfg, self.var_profile.get())
+        if not p: return
+        rings,_,_,_,_,_,auto = compute_rings_from_profile(self.cfg,p)
+        self.log("Rings [{}]: {}".format("AUTO" if auto else "MANUAL",
+            " | ".join(f"S={s:.1f} E={e:.1f}" for s,e in rings)))
 
     def preview_auto_rings_for_active_profile(self):
         self._sync_cfg_from_ui()
-        ap = self.cfg.get("active_profile", "")
-        p = get_profile(self.cfg, ap)
-        if not p:
-            self.log("No active profile selected.")
-            return
-        h = float(p.get("height_cm", 20.0))
-        w = float(p.get("width_cm", 30.0))
-        c = float(p.get("clearance_cm", 5.0))
-        rings, ws, ew, ee, rad, mid = compute_rings_auto(self.cfg, h, w, c)
-        self.log("--- AUTO RINGS PREVIEW (ACTIVE PROFILE) ---")
-        self.log("Active profile={} | H={:.1f} W={:.1f} clear={:.1f}".format(ap, h, w, c))
-        self.log("EffectiveW={:.1f} | width_scale={:.2f} | elbow_push=+{:.1f}°".format(ew, ws, ee))
-        self.log("Mid pose: S={:.1f} E={:.1f}".format(mid[0], mid[1]))
-        self.log("Rings (S,E): " + " | ".join(["({:.1f},{:.1f})".format(s, e) for (s, e) in rings]))
+        p = get_profile(self.cfg, self.cfg.get("active_profile",""))
+        if not p: self.log("No active profile."); return
+        rings,_,_,_,_,mid = compute_rings_auto(self.cfg,
+            float(p.get("height_cm",20)),float(p.get("width_cm",30)),float(p.get("clearance_cm",5)))
+        self.log("AUTO rings: mid=S{:.1f} E{:.1f} | {}".format(
+            mid[0],mid[1]," | ".join(f"S={s:.1f} E={e:.1f}" for s,e in rings)))
 
     def _sync_ui_from_cfg_profiles_only(self):
         self.refresh_profiles_dropdown()
-        self.var_active_profile.set(self.cfg.get("active_profile", ""))
+        self.var_active_profile.set(self.cfg.get("active_profile",""))
         if self.cfg.get("active_profile") in (self.cmb_profile["values"] or []):
             self.var_profile.set(self.cfg["active_profile"])
         elif self.cmb_profile["values"]:
             self.var_profile.set(self.cmb_profile["values"][0])
         self.load_selected_profile_to_editor()
 
-    # ---------- sync UI <-> cfg ----------
-    def _sync_cfg_from_ui(self):
-        self.cfg["robot_ssid"] = self.var_ssid.get().strip()
-        self.cfg["robot_pass"] = self.var_pass.get()
-        self.cfg["robot_base"] = self.var_base.get().strip()
+    def export_profiles_json(self):
+        self._sync_cfg_from_ui()
+        path = filedialog.asksaveasfilename(defaultextension=".json",filetypes=[("JSON","*.json")])
+        if not path: return
+        with open(path,"w",encoding="utf-8") as f:
+            json.dump({"active_profile":self.cfg.get("active_profile",""),
+                       "profiles":self.cfg.get("profiles",[])},f,indent=2)
+        self.log(f"Exported profiles: {path}")
 
-        self.cfg["use_cameras"] = bool(self.var_use_cam.get())
-        self.cfg["rotate_180"] = bool(self.var_rot180.get())
-        self.cfg["pi_host"] = self.var_pi_host.get().strip()
+    def import_profiles_json(self):
+        path = filedialog.askopenfilename(filetypes=[("JSON","*.json")])
+        if not path: return
         try:
-            self.cfg["pi_ssh_port"] = int(str(self.var_pi_port.get()).strip() or "22")
-        except Exception:
-            self.cfg["pi_ssh_port"] = 22
-        self.cfg["pi_user"] = self.var_pi_user.get().strip()
-        self.cfg["pi_capture"] = self.var_pi_cap.get().strip()
+            with open(path,"r",encoding="utf-8") as f: payload = json.load(f)
+            if isinstance(payload,dict) and "profiles" in payload:
+                self.cfg["profiles"]=payload.get("profiles",[])
+                if payload.get("active_profile"): self.cfg["active_profile"]=payload["active_profile"]
+            elif isinstance(payload,list): self.cfg["profiles"]=payload
+            else: raise ValueError("Invalid format")
+            self.refresh_profiles_dropdown(); self._ensure_active_profile()
+            self._sync_ui_from_cfg_profiles_only()
+            self.log(f"Imported profiles: {path}")
+        except Exception as e: messagebox.showerror("Import error",str(e))
 
-        self.cfg["mode"] = self.var_mode.get()
-        self.cfg["final_total_images"] = int(self.var_final_images.get())
-        self.cfg["test_total_images"] = int(self.var_test_images.get())
-
-        self.cfg["spd"] = int(self.var_spd.get())
-        self.cfg["acc"] = int(self.var_acc.get())
-        self.cfg["delay_s"] = float(self.var_delay.get())
-        self.cfg["hold_last_pose"] = bool(self.var_hold.get())
-
-        self.cfg["base_center_deg"] = float(self.var_base_center.get())
-        self.cfg["base_half_span_deg"] = float(self.var_base_half.get())
-        self.cfg["safe_limit_deg"] = float(self.var_safe_lim.get())
-        self.cfg["lock_hand_deg"] = float(self.var_hand_lock.get())
-
-        self.cfg["height_low_cm"] = float(self.var_h_low.get())
-        self.cfg["height_high_cm"] = float(self.var_h_high.get())
-        self.cfg["pose_low_sh_deg"] = float(self.var_s_low.get())
-        self.cfg["pose_low_el_deg"] = float(self.var_e_low.get())
-        self.cfg["pose_high_sh_deg"] = float(self.var_s_high.get())
-        self.cfg["pose_high_el_deg"] = float(self.var_e_high.get())
-        self.cfg["ring_height_span_deg"] = float(self.var_span_h.get())
-        self.cfg["ring_width_span_deg"] = float(self.var_span_w.get())
-        self.cfg["elbow_push_gain"] = float(self.var_el_gain.get())
-        self.cfg["elbow_push_radius0_cm"] = float(self.var_el_r0.get())
-
-        # active profile (from UI mirror)
-        self.cfg["active_profile"] = self.var_active_profile.get().strip()
+    # ── sync ─────────────────────────────────────────────────
+    def _sync_cfg_from_ui(self):
+        self.cfg.update({
+            "robot_ssid":  self.var_ssid.get().strip(),
+            "robot_pass":  self.var_pass.get(),
+            "robot_base":  self.var_base.get().strip(),
+            "use_cameras": bool(self.var_use_cam.get()),
+            "rotate_180":  bool(self.var_rot180.get()),
+            "pi_host":     self.var_pi_host.get().strip(),
+            "pi_port":     int(self.var_pi_port.get().strip() or "8765"),
+            "mode":               self.var_mode.get(),
+            "final_total_images": int(self.var_final_images.get()),
+            "test_total_images":  int(self.var_test_images.get()),
+            "spd":            int(self.var_spd.get()),
+            "acc":            int(self.var_acc.get()),
+            "delay_s":        float(self.var_delay.get()),
+            "hold_last_pose": bool(self.var_hold.get()),
+            "base_center_deg":    float(self.var_base_center.get()),
+            "base_half_span_deg": float(self.var_base_half.get()),
+            "safe_limit_deg":     float(self.var_safe_lim.get()),
+            "lock_hand_deg":      float(self.var_hand_lock.get()),
+            "height_low_cm":        float(self.var_h_low.get()),
+            "height_high_cm":       float(self.var_h_high.get()),
+            "pose_low_sh_deg":      float(self.var_s_low.get()),
+            "pose_low_el_deg":      float(self.var_e_low.get()),
+            "pose_high_sh_deg":     float(self.var_s_high.get()),
+            "pose_high_el_deg":     float(self.var_e_high.get()),
+            "ring_height_span_deg": float(self.var_span_h.get()),
+            "ring_width_span_deg":  float(self.var_span_w.get()),
+            "elbow_push_gain":      float(self.var_el_gain.get()),
+            "elbow_push_radius0_cm":float(self.var_el_r0.get()),
+            "active_profile": self.var_active_profile.get().strip(),
+        })
 
     def _sync_ui_from_cfg(self):
-        self.var_ssid.set(self.cfg.get("robot_ssid", ""))
-        self.var_pass.set(self.cfg.get("robot_pass", ""))
-        self.var_base.set(self.cfg.get("robot_base", ""))
-
-        self.var_use_cam.set(bool(self.cfg.get("use_cameras", True)))
-        self.var_rot180.set(bool(self.cfg.get("rotate_180", True)))
-        self.var_pi_host.set(self.cfg.get("pi_host", ""))
-        self.var_pi_port.set(str(self.cfg.get("pi_ssh_port", 22)))
-        self.var_pi_user.set(self.cfg.get("pi_user", ""))
-        self.var_pi_cap.set(self.cfg.get("pi_capture", ""))
-
-        self.var_mode.set(self.cfg.get("mode", "Final"))
-        self.var_final_images.set(int(self.cfg.get("final_total_images", 200)))
-        self.var_test_images.set(int(self.cfg.get("test_total_images", 10)))
-
-        self.var_spd.set(int(self.cfg.get("spd", 20)))
-        self.var_acc.set(int(self.cfg.get("acc", 20)))
-        self.var_delay.set(float(self.cfg.get("delay_s", 0.3)))
-        self.var_hold.set(bool(self.cfg.get("hold_last_pose", True)))
-
-        self.var_base_center.set(float(self.cfg.get("base_center_deg", 90.0)))
-        self.var_base_half.set(float(self.cfg.get("base_half_span_deg", 155.0)))
-        self.var_safe_lim.set(float(self.cfg.get("safe_limit_deg", 175.0)))
-        self.var_hand_lock.set(float(self.cfg.get("lock_hand_deg", 62.0)))
-
-        self.var_h_low.set(float(self.cfg.get("height_low_cm", 10.0)))
-        self.var_h_high.set(float(self.cfg.get("height_high_cm", 60.0)))
-        self.var_s_low.set(float(self.cfg.get("pose_low_sh_deg", -84.0)))
-        self.var_e_low.set(float(self.cfg.get("pose_low_el_deg", 92.0)))
-        self.var_s_high.set(float(self.cfg.get("pose_high_sh_deg", -60.0)))
-        self.var_e_high.set(float(self.cfg.get("pose_high_el_deg", 70.0)))
-        self.var_span_h.set(float(self.cfg.get("ring_height_span_deg", 10.0)))
-        self.var_span_w.set(float(self.cfg.get("ring_width_span_deg", 6.0)))
-        self.var_el_gain.set(float(self.cfg.get("elbow_push_gain", 0.8)))
-        self.var_el_r0.set(float(self.cfg.get("elbow_push_radius0_cm", 10.0)))
-
-        self.var_active_profile.set(self.cfg.get("active_profile", ""))
+        self.var_ssid.set(self.cfg.get("robot_ssid",""))
+        self.var_pass.set(self.cfg.get("robot_pass",""))
+        self.var_base.set(self.cfg.get("robot_base",""))
+        self.var_use_cam.set(bool(self.cfg.get("use_cameras",True)))
+        self.var_rot180.set(bool(self.cfg.get("rotate_180",True)))
+        self.var_pi_host.set(self.cfg.get("pi_host",""))
+        self.var_pi_port.set(str(self.cfg.get("pi_port",8765)))
+        self.var_mode.set(self.cfg.get("mode","Final"))
+        self.var_final_images.set(int(self.cfg.get("final_total_images",200)))
+        self.var_test_images.set(int(self.cfg.get("test_total_images",10)))
+        self.var_spd.set(int(self.cfg.get("spd",20)))
+        self.var_acc.set(int(self.cfg.get("acc",20)))
+        self.var_delay.set(float(self.cfg.get("delay_s",0.3)))
+        self.var_hold.set(bool(self.cfg.get("hold_last_pose",True)))
+        self.var_base_center.set(float(self.cfg.get("base_center_deg",90)))
+        self.var_base_half.set(float(self.cfg.get("base_half_span_deg",155)))
+        self.var_safe_lim.set(float(self.cfg.get("safe_limit_deg",175)))
+        self.var_hand_lock.set(float(self.cfg.get("lock_hand_deg",62)))
+        self.var_h_low.set(float(self.cfg.get("height_low_cm",10)))
+        self.var_h_high.set(float(self.cfg.get("height_high_cm",60)))
+        self.var_s_low.set(float(self.cfg.get("pose_low_sh_deg",-84)))
+        self.var_e_low.set(float(self.cfg.get("pose_low_el_deg",92)))
+        self.var_s_high.set(float(self.cfg.get("pose_high_sh_deg",-60)))
+        self.var_e_high.set(float(self.cfg.get("pose_high_el_deg",70)))
+        self.var_span_h.set(float(self.cfg.get("ring_height_span_deg",10)))
+        self.var_span_w.set(float(self.cfg.get("ring_width_span_deg",6)))
+        self.var_el_gain.set(float(self.cfg.get("elbow_push_gain",0.8)))
+        self.var_el_r0.set(float(self.cfg.get("elbow_push_radius0_cm",10)))
+        self.var_active_profile.set(self.cfg.get("active_profile",""))
         self.refresh_profiles_dropdown()
         if self.cfg.get("active_profile") in (self.cmb_profile["values"] or []):
             self.var_profile.set(self.cfg["active_profile"])
@@ -1299,322 +1140,226 @@ class App(ttk.Frame):
             self.var_profile.set(self.cmb_profile["values"][0])
         self.load_selected_profile_to_editor()
 
-    # ---------- actions ----------
+    # ── config I/O ───────────────────────────────────────────
+    def save_config(self):
+        self._sync_cfg_from_ui()
+        path = filedialog.asksaveasfilename(defaultextension=".json",filetypes=[("JSON","*.json")])
+        if not path: return
+        with open(path,"w",encoding="utf-8") as f: json.dump(self.cfg,f,indent=2)
+        messagebox.showinfo("Saved",f"Config saved:\n{path}")
+
+    def load_config(self):
+        path = filedialog.askopenfilename(filetypes=[("JSON","*.json")])
+        if not path: return
+        try:
+            with open(path,"r",encoding="utf-8") as f: self.cfg=json.load(f)
+            self._sync_ui_from_cfg(); self._ensure_active_profile()
+            messagebox.showinfo("Loaded",f"Config loaded:\n{path}")
+        except Exception as e: messagebox.showerror("Load error",str(e))
+
+    def save_log(self):
+        path = filedialog.asksaveasfilename(defaultextension=".txt",filetypes=[("Text","*.txt")])
+        if not path: return
+        self.txt.configure(state="normal")
+        with open(path,"w",encoding="utf-8") as f: f.write(self.txt.get("1.0","end"))
+        self.txt.configure(state="disabled")
+        messagebox.showinfo("Saved",f"Log saved:\n{path}")
+
+    # ── actions ───────────────────────────────────────────────
+    def open_browser(self):
+        self._sync_cfg_from_ui()
+        host = self.cfg.get("pi_host","192.168.4.20")
+        port = self.cfg.get("pi_port",8765)
+        url  = f"http://{host}:{port}/browse"
+        self.log(f"Opening browser: {url}")
+        webbrowser.open(url)
+
     def on_connect_wifi(self):
+        if _IS_WINDOWS: messagebox.showinfo("Wi-Fi","Connect from Windows taskbar."); return
         self._sync_cfg_from_ui()
         try:
             ensure_connected_to(self.cfg["robot_ssid"], self.cfg["robot_pass"])
             self.log("Connected to robot Wi-Fi ✅")
         except Exception as e:
-            self.log("Wi-Fi connect error: {}".format(e))
-            messagebox.showerror("Wi-Fi", str(e))
+            self.log(f"Wi-Fi error: {e}")
+            messagebox.showerror("Wi-Fi",str(e))
 
     def on_test_robot(self):
         self._sync_cfg_from_ui()
         try:
             fb = get_feedback(self.cfg, log=self.log)
-            b = math.degrees(fb.get("b", 0.0))
-            self.log("Robot responds ✅ (base {:.1f}°)".format(b))
+            self.log("Robot ✅  base={:.1f}°".format(math.degrees(fb.get("b",0))))
         except Exception as e:
-            self.log("Robot test failed: {}".format(e))
-            messagebox.showerror("Robot", str(e))
+            self.log(f"Robot test failed: {e}")
+            messagebox.showerror("Robot",str(e))
 
     def on_read_angles(self):
         self._sync_cfg_from_ui()
         fb = get_feedback(self.cfg, log=self.log)
-        b = math.degrees(fb.get("b", 0.0))
-        s = math.degrees(fb.get("s", 0.0))
-        e = math.degrees(fb.get("e", 0.0))
-        h = math.degrees(fb.get("t", 0.0))
-        self.log("Angles: b={:.1f} s={:.1f} e={:.1f} h={:.1f}".format(b, s, e, h))
+        self.log("Angles: b={:.1f} s={:.1f} e={:.1f} h={:.1f}".format(
+            math.degrees(fb.get("b",0)), math.degrees(fb.get("s",0)),
+            math.degrees(fb.get("e",0)), math.degrees(fb.get("t",0))))
 
     def on_read_angles_to_sliders(self):
         self._sync_cfg_from_ui()
         fb = get_feedback(self.cfg, log=self.log)
-        self.var_m_base.set(math.degrees(fb.get("b", 0.0)))
-        self.var_m_s.set(math.degrees(fb.get("s", 0.0)))
-        self.var_m_e.set(math.degrees(fb.get("e", 0.0)))
-        self.var_m_h.set(math.degrees(fb.get("t", 0.0)))
-        self.log("Loaded angles into sliders ✅")
+        self.var_m_base.set(math.degrees(fb.get("b",0)))
+        self.var_m_s.set(   math.degrees(fb.get("s",0)))
+        self.var_m_e.set(   math.degrees(fb.get("e",0)))
+        self.var_m_h.set(   math.degrees(fb.get("t",0)))
+        self.log("Angles loaded to sliders ✅")
 
     def on_manual_move(self):
         self._sync_cfg_from_ui()
         try:
             torque(self.cfg, on=True, log=self.log)
-            move_joints_deg(
-                self.cfg,
-                base=float(self.var_m_base.get()),
-                shoulder=float(self.var_m_s.get()),
-                elbow=float(self.var_m_e.get()),
-                hand=float(self.var_m_h.get()),
-                spd=self.cfg["spd"],
-                acc=self.cfg["acc"],
-                log=self.log
-            )
-            self.log("Manual move done ✅")
+            move_joints_deg(self.cfg,
+                base=float(self.var_m_base.get()), shoulder=float(self.var_m_s.get()),
+                elbow=float(self.var_m_e.get()),   hand=float(self.var_m_h.get()),
+                spd=self.cfg["spd"], acc=self.cfg["acc"], log=self.log)
+            self.log("Manual move ✅")
             self.on_read_angles()
         except Exception as e:
-            self.log("Manual move failed: {}".format(e))
-            messagebox.showerror("Manual move", str(e))
+            self.log(f"Move failed: {e}")
+            messagebox.showerror("Manual move",str(e))
 
     def on_test_pi(self):
         self._sync_cfg_from_ui()
-
-        # 1) Robust SSH check (auto-discovery if enabled)
-        ok, msg = ensure_pi_ssh(self.cfg, log=self.log)
+        ok, msg = ensure_pi_http(self.cfg, log=self.log)
         if not ok:
-            messagebox.showerror(
-                "Pi SSH",
-                "SSH not available:\n" + str(msg) + "\n\n"
-                "Permanent fix (recommended):\n"
-                "1) Give the Pi a STATIC IP on the robot Wi‑Fi (e.g. 192.168.4.20)\n"
-                "2) Or keep 'Pi auto-discover' enabled (this app can scan a small IP range)."
-            )
-            return
-
-
-        # If ensure_pi_ssh updated pi_host, reflect in UI
-        self.var_pi_host.set(self.cfg.get("pi_host", ""))
-        self.log("SSH works ✅")
-
-        # 3) USB mount check
-        usb = pi_detect_usb_mount(self.cfg, log=self.log)
-        if usb:
-            self.log("USB detected on Pi ✅  mount={}".format(usb))
-        else:
-            self.log("USB not detected on Pi ❌ (no mounted /media/*/*)")
+            messagebox.showerror("Pi Server",
+                f"Cannot reach Pi:\n{msg}\n\nMake sure pi_server.py is running."); return
+        self.var_pi_host.set(self.cfg.get("pi_host",""))
+        self.log(f"Pi server ✅ — {msg}")
+        storage, stype = pi_get_storage(self.cfg, log=self.log)
+        self.log(f"Storage: {storage} ({stype})")
 
     def on_test_capture(self):
         self._sync_cfg_from_ui()
-
-        # Ensure Pi SSH is reachable (auto-discovery if enabled)
-        ok, msg = ensure_pi_ssh(self.cfg, log=self.log)
-        if not ok:
-            messagebox.showerror(
-                "Pi SSH",
-                "SSH not available on the Pi.\n\n"
-                "Error: {}\n\n"
-                "Permanent fix (recommended):\n"
-                "1) Give the Pi a STATIC IP on the robot Wi‑Fi (e.g. 192.168.4.20)\n"
-                "2) Or keep 'Pi auto-discover' enabled (this app can scan a small IP range)."
-                .format(msg or "unknown error")
-            )
-            return
-
-
-        # If ensure_pi_ssh updated pi_host, reflect in UI
-        self.var_pi_host.set(self.cfg.get("pi_host", ""))
-
-        # Now it's safe to query USB mounts over SSH
-        usb = pi_detect_usb_mount(self.cfg, log=self.log)
-        date_folder = datetime.now().strftime("%Y%m%d")
-        if usb:
-            dest = "{}/captures/_test/{}".format(usb, date_folder)
-        else:
-            dest = "/home/{}/captures/_test/{}".format(self.cfg["pi_user"], date_folder)
-
-        tag = "UI_TEST_{}".format(datetime.now().strftime("%H%M%S"))
-        self.log("Test capture tag={} dest={}".format(tag, dest))
-        ok = trigger_capture_store_rotate(self.cfg, tag, dest, log=self.log)
-        self.log("Test capture: {} tag={}".format("OK ✅" if ok else "FAIL ❌", tag))
+        ok, msg = ensure_pi_http(self.cfg, log=self.log)
+        if not ok: messagebox.showerror("Pi",f"Cannot reach Pi:\n{msg}"); return
+        self.var_pi_host.set(self.cfg.get("pi_host",""))
+        storage, stype = pi_get_storage(self.cfg, log=self.log)
+        dest = f"{storage}/captures/_test/{datetime.now().strftime('%Y%m%d')}"
+        tag  = f"TEST_{datetime.now().strftime('%H%M%S')}"
+        self.log(f"Test capture tag={tag}  dest={dest}")
+        ok2 = trigger_capture_store_rotate(self.cfg, tag, dest, log=self.log)
+        self.log(f"Test capture: {'OK ✅' if ok2 else 'FAIL ❌'}")
 
     def on_abort(self):
         self.abort_event.set()
-        self.log("ABORT requested… (stopping at next safe point)")
+        self.log("ABORT requested…")
         self.btn_abort.configure(state="disabled")
 
+    # ── START SCAN ───────────────────────────────────────────
     def on_start(self):
         if self.worker and self.worker.is_alive():
-            messagebox.showwarning("Running", "Scan is already running.")
-            return
+            messagebox.showwarning("Running","Scan already running."); return
 
         self._sync_cfg_from_ui()
-
         test_name = self.var_testname.get().strip()
-        if not test_name:
-            messagebox.showerror("Test name", "Please enter a test name.")
-            return
+        if not test_name: messagebox.showerror("Test name","Enter a test name."); return
 
-        # MUST have active profile
-        active = self.cfg.get("active_profile", "").strip()
-        if not active:
-            messagebox.showerror("Profile", "Please set an Active Profile in Plant Profiles tab.")
-            return
+        active = self.cfg.get("active_profile","").strip()
+        if not active: messagebox.showerror("Profile","Set an Active Profile first."); return
         prof = get_profile(self.cfg, active)
-        if not prof:
-            messagebox.showerror("Profile", "Active profile not found. Re-set Active Profile.")
-            return
+        if not prof: messagebox.showerror("Profile","Active profile not found."); return
 
         mode = self.var_mode.get()
-        if mode == "Test":
-            total_images = int(self.cfg["test_total_images"])
-        elif mode == "Final":
-            total_images = int(self.cfg["final_total_images"])
-        else:
-            total_images = 30
+        total = (int(self.cfg["test_total_images"])  if mode=="Test"  else
+                 int(self.cfg["final_total_images"]) if mode=="Final" else 30)
+        if total < 3: messagebox.showerror("Images","Total images must be >= 3."); return
 
-        if total_images < 3:
-            messagebox.showerror("Images", "Total images must be >= 3.")
-            return
+        if self._live_running:
+            self._stop_live_view()
+            self.log("Live view stopped for scan.")
+            time.sleep(0.6)
 
         self.abort_event.clear()
         self.btn_start.configure(state="disabled")
         self.btn_abort.configure(state="normal")
-        self.set_progress(0.0, "Starting…")
+        self.set_progress(0.0,"Starting…")
 
         def worker():
-            start_wall = datetime.now()
             t0 = time.time()
-            self.log("\n--- START ---")
-            self.log("Mode: {} | Active Profile: {}".format(mode, active))
-            self.log("Start time: {}".format(start_wall.strftime("%Y-%m-%d %H:%M:%S")))
-
+            self.log(f"\n{'─'*50}")
+            self.log(f"--- START  {mode} | {active} ---")
+            self.log(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             try:
-                try:
-                    ensure_connected_to(self.cfg["robot_ssid"], self.cfg["robot_pass"])
-                    self.log("Robot Wi-Fi OK ✅")
-                except Exception as e:
-                    self.log("Wi-Fi warning: {} (continuing)".format(e))
+                if self.cfg.get("use_cameras"):
+                    ok_pi, msg_pi = ensure_pi_http(self.cfg, log=self.log)
+                    if not ok_pi: raise RuntimeError(f"Pi not available: {msg_pi}")
+                    self.root.after(0, lambda: self.var_pi_host.set(self.cfg.get("pi_host","")))
+                    self.log("Pi ✅")
 
                 torque(self.cfg, on=True, log=self.log)
-
-                # Ensure Pi SSH once at start (so we fail early with a clear message)
-                if self.cfg.get("use_cameras"):
-                    ok_pi, msg_pi = ensure_pi_ssh(self.cfg, log=self.log)
-                    if not ok_pi:
-                        raise RuntimeError(f"Pi SSH not available: {msg_pi}")
-                    # reflect discovered IP in UI
-                    self.master.after(0, lambda: self.var_pi_host.set(self.cfg.get("pi_host", "")))
-
                 fb0 = get_feedback(self.cfg, log=self.log)
-                start_b = math.degrees(fb0.get("b", 0.0))
-                self.log("Start base: {:.1f}°".format(start_b))
+                start_b = math.degrees(fb0.get("b",0))
+                self.log(f"Start base: {start_b:.1f}°")
 
-                # profile inputs
-                h_cm = float(prof.get("height_cm", 20.0))
-                w_cm = float(prof.get("width_cm", 30.0))
-                c_cm = float(prof.get("clearance_cm", 5.0))
-                self.log("Test={} | H={:.1f}cm W={:.1f}cm clear={:.1f}cm".format(test_name, h_cm, w_cm, c_cm))
-
-                # storage
-                usb = pi_detect_usb_mount(self.cfg, log=self.log) if self.cfg["use_cameras"] else ""
+                storage, stype = pi_get_storage(self.cfg, log=self.log) if self.cfg["use_cameras"] else ("/home/umap/captures","SD")
                 date_folder = datetime.now().strftime("%Y%m%d")
-                if usb:
-                    base_storage = "{}/captures/{}/{}".format(usb, test_name, date_folder)
-                    self.log("USB: {}".format(usb))
-                else:
-                    base_storage = "/home/{}/captures/{}/{}".format(self.cfg["pi_user"], test_name, date_folder)
-                    self.log("USB: not found (saving to Pi home)")
+                base_storage = f"{storage}/captures/{test_name}/{date_folder}"
+                self.log(f"Storage ({stype}): {base_storage}/")
 
                 if self.cfg["use_cameras"]:
-                    ok, msg = pi_mkdir(self.cfg, base_storage)
-                    if not ok:
-                        raise RuntimeError("Could not create storage folder: {}".format(msg))
-                self.log("Storage: {}/".format(base_storage))
+                    ok_mk, msg_mk = pi_mkdir(self.cfg, base_storage)
+                    if not ok_mk: raise RuntimeError(f"Cannot create storage: {msg_mk}")
 
-                # rings based on ACTIVE profile
-                rings, ws, ew, ee, rad, mid, used_auto = compute_rings_from_profile(self.cfg, prof)
-                self.log("Rings source: {}".format("AUTO (Height Mapping)" if used_auto else "MANUAL (Profile)"))
-                self.log("Rings (S,E): " + " | ".join(["({:.1f},{:.1f})".format(s, e) for (s, e) in rings]))
+                rings,_,_,_,_,_,auto = compute_rings_from_profile(self.cfg, prof)
+                self.log("Rings [{}]: {}".format("AUTO" if auto else "MANUAL",
+                    " | ".join(f"S={s:.1f} E={e:.1f}" for s,e in rings)))
 
-                per = [total_images // 3] * 3
-                for i in range(total_images % 3):
-                    per[i] += 1
-                self.log("Total images={} | per ring={}".format(total_images, per))
+                per = [total//3]*3
+                for i in range(total%3): per[i]+=1
+                self.log(f"Total={total} | per ring={per}")
 
-                center = float(self.cfg["base_center_deg"])
-                half = float(self.cfg["base_half_span_deg"])
+                center   = float(self.cfg["base_center_deg"])
+                half     = float(self.cfg["base_half_span_deg"])
                 safe_lim = float(self.cfg["safe_limit_deg"])
-                self.log("Sweep: center={:.1f}° half_span=±{:.1f}° | safe_limit=±{:.1f}°".format(center, half, safe_lim))
-                self.log("Speed spd={} acc={} delay={:.2f}s".format(self.cfg["spd"], self.cfg["acc"], self.cfg["delay_s"]))
-                self.log("Hold last pose: {}".format("YES" if self.cfg["hold_last_pose"] else "NO"))
+                done     = 0
 
-                done = 0
-
-                for ring_i, ((s_deg, e_deg), ring_count) in enumerate(zip(rings, per), start=1):
-                    if self.abort_event.is_set():
-                        break
-
-                    self.log("Ring {}/3: S={:.1f} E={:.1f} images={}".format(ring_i, s_deg, e_deg, ring_count))
-
-                    move_joints_deg(
-                        self.cfg,
-                        shoulder=s_deg, elbow=e_deg, hand=self.cfg["lock_hand_deg"],
-                        spd=self.cfg["spd"], acc=self.cfg["acc"],
-                        log=None
-                    )
-
-                    plan = plan_angles_centered(
-                        center_deg=center,
-                        half_span_deg=half,
-                        count=ring_count,
-                        safe_limit_deg=safe_lim,
-                        start_b_deg=start_b if ring_i == 1 else None
-                    )
-
+                for ring_i, ((s_deg,e_deg), ring_count) in enumerate(zip(rings,per), start=1):
+                    if self.abort_event.is_set(): break
+                    self.log(f"Ring {ring_i}/3: S={s_deg:.1f} E={e_deg:.1f} ({ring_count} shots)")
+                    move_joints_deg(self.cfg, shoulder=s_deg, elbow=e_deg,
+                                    hand=self.cfg["lock_hand_deg"],
+                                    spd=self.cfg["spd"], acc=self.cfg["acc"], log=None)
+                    plan = plan_angles_centered(center, half, ring_count, safe_lim,
+                                               start_b if ring_i==1 else None)
                     for b_deg in plan:
-                        if self.abort_event.is_set():
-                            break
-
+                        if self.abort_event.is_set(): break
                         safe_b = clip_base_deg(b_deg, safe_lim)
-                        step_idx = done + 1
-
-                        move_joints_deg(
-                            self.cfg,
-                            base=safe_b,
-                            shoulder=s_deg, elbow=e_deg, hand=self.cfg["lock_hand_deg"],
-                            spd=self.cfg["spd"], acc=self.cfg["acc"],
-                            log=None
-                        )
-
-                        tag = "{}_R{}_{}_b{}_S{}".format(
-                            test_name, ring_i, str(step_idx).zfill(3),
-                            int(round(safe_b)), int(round(s_deg))
-                        )
-
+                        done  += 1
+                        move_joints_deg(self.cfg, base=safe_b, shoulder=s_deg, elbow=e_deg,
+                                        hand=self.cfg["lock_hand_deg"],
+                                        spd=self.cfg["spd"], acc=self.cfg["acc"], log=None)
+                        tag = f"{test_name}_R{ring_i}_{str(done).zfill(3)}_b{int(round(safe_b))}_S{int(round(s_deg))}"
                         if self.cfg["use_cameras"]:
-                            okcap = trigger_capture_store_rotate(self.cfg, tag, base_storage, log=None)
-                            if not okcap:
-                                self.log("CAPTURE FAIL at {}/{} (tag={})".format(step_idx, total_images, tag))
+                            if not trigger_capture_store_rotate(self.cfg, tag, base_storage, log=self.log):
+                                self.log(f"CAPTURE FAIL at {done}/{total} (tag={tag})")
 
-                        done += 1
-
-                        elapsed = time.time() - t0
-                        rate = elapsed / max(1, done)
-                        eta_s = int(rate * (total_images - done))
-                        pred_end = datetime.now() + timedelta(seconds=eta_s)
-
-                        self.master.after(
-                            0,
-                            lambda frac=float(done) / float(total_images), txt="{}/{}".format(done, total_images):
-                            self.set_progress(frac, txt)
-                        )
-
-                        if done % 10 == 0 or done == total_images:
-                            self.log("Progress {}/{} | ETA {} | PredEnd {}".format(
-                                done, total_images, timedelta(seconds=eta_s), pred_end.strftime("%H:%M:%S")
-                            ))
-
+                        eta_s    = int((time.time()-t0)/max(1,done)*(total-done))
+                        pred_end = datetime.now()+timedelta(seconds=eta_s)
+                        self.root.after(0,
+                            lambda frac=float(done)/float(total), txt=f"{done}/{total}":
+                            self.set_progress(frac, txt))
+                        if done%10==0 or done==total:
+                            self.log(f"Progress {done}/{total} | ETA {timedelta(seconds=eta_s)} | End {pred_end.strftime('%H:%M:%S')}")
                         time.sleep(float(self.cfg["delay_s"]))
 
-                end_wall = datetime.now()
-                self.log("End time: {}".format(end_wall.strftime("%Y-%m-%d %H:%M:%S")))
-                self.log("Elapsed: {}".format(timedelta(seconds=int(time.time() - t0))))
-
-                if not self.cfg["hold_last_pose"]:
-                    torque(self.cfg, on=False, log=self.log)
-                    self.log("Torque OFF")
-                    self.log("DONE ✅")
-                else:
-                    self.log("DONE ✅ (robot holds last pose)")
+                self.log(f"Elapsed: {timedelta(seconds=int(time.time()-t0))}")
+                if not self.cfg["hold_last_pose"]: torque(self.cfg, on=False, log=self.log)
+                self.log("DONE ✅")
+                self.log(f"Browse images → http://{self.cfg.get('pi_host','192.168.4.20')}:{self.cfg.get('pi_port',8765)}/browse")
 
             except Exception as e:
-                self.log("ERROR: {}".format(e))
-                self.master.after(0, lambda: messagebox.showerror("Scan error", str(e)))
+                self.log(f"ERROR: {e}")
+                self.root.after(0, lambda: messagebox.showerror("Scan error", str(e)))
             finally:
-                self.master.after(0, lambda: self.btn_start.configure(state="normal"))
-                self.master.after(0, lambda: self.btn_abort.configure(state="disabled"))
-                self.master.after(0, lambda: self.set_progress(0.0, "Idle"))
+                self.root.after(0, lambda: self.btn_start.configure(state="normal"))
+                self.root.after(0, lambda: self.btn_abort.configure(state="disabled"))
+                self.root.after(0, lambda: self.set_progress(0.0, "Idle"))
 
         self.worker = threading.Thread(target=worker, daemon=True)
         self.worker.start()
@@ -1627,4 +1372,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
