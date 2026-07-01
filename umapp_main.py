@@ -87,8 +87,8 @@ DEFAULT = {
     "rotate_180": True,
     "hold_last_pose": True,
     "lock_hand_deg": 62.0,
-    "base_center_deg": 90.0,
-    "base_half_span_deg": 155.0,
+    "base_center_deg": 0.0,
+    "base_half_span_deg": 175.0,
     "spd": 20,
     "acc": 20,
     "delay_s": 0.30,
@@ -106,13 +106,13 @@ DEFAULT = {
     "ring_width_span_deg": 6.0,
     "elbow_push_gain": 0.8,
     "elbow_push_radius0_cm": 10.0,
-    "sh_min": -120.0, "sh_max": -30.0,
+    "sh_min": -120.0, "sh_max": 120.0,
     "el_min": 20.0,   "el_max": 110.0,
     "profiles": [{
         "name": "Plant_A",
         "height_cm": 20.0, "width_cm": 30.0, "clearance_cm": 5.0,
         "use_manual_rings": True,
-        "manual_rings": [{"s":-84.0,"e":92.0},{"s":-74.0,"e":82.0},{"s":-64.0,"e":72.0}],
+        "manual_rings": [{"s":80.0,"e":75.0},{"s":75.0,"e":75.0},{"s":70.0,"e":70.0}],
     }],
 }
 
@@ -271,16 +271,58 @@ def clamp(x,a,b): return max(a,min(b,x))
 def clip_base_deg(a,lim): return clamp(a,-lim,lim)
 
 def plan_angles_centered(center, half, count, safe_lim, start_b=None):
+    """Legacy centered sweep. Kept for compatibility.
+
+    NOTE: This can be clipped if center+/-half exceeds the safe limit.
+    For 360 object coverage, use plan_base_360_sweep() instead.
+    """
     half = min(float(half), float(safe_lim))
     center = clip_base_deg(float(center), safe_lim)
     lo = clip_base_deg(center-half, safe_lim)
     hi = clip_base_deg(center+half, safe_lim)
-    if count <= 1: return [center]
+    if count <= 1:
+        return [center]
     arr = [lo + i*(hi-lo)/(count-1) for i in range(count)]
-    if start_b is None: return arr
+    if start_b is None:
+        return arr
     start_b = clip_base_deg(float(start_b), safe_lim)
-    best = min(range(len(arr)), key=lambda i: abs(arr[i]-start_b))
-    return arr[best:] + arr[:best]
+    # Do NOT rotate the list by slicing, because that creates a sudden jump
+    # from +limit to -limit inside one ring. Instead choose the nearest end.
+    if abs(start_b - hi) < abs(start_b - lo):
+        arr.reverse()
+    return arr
+
+def choose_360_start_reverse(start_b, safe_lim):
+    """Return True when it is shorter to start the 360 sweep from +safe_lim."""
+    if start_b is None:
+        return False
+    safe_lim = abs(float(safe_lim))
+    start_b = clip_base_deg(float(start_b), safe_lim)
+    dist_to_lo = abs(start_b - (-safe_lim))
+    dist_to_hi = abs(start_b - ( safe_lim))
+    return dist_to_hi < dist_to_lo
+
+def plan_base_360_sweep(count, safe_lim, reverse=False):
+    """Plan the widest possible base sweep: -safe_limit to +safe_limit.
+
+    With a +/-175 degree servo this gives 350 degrees of mechanical base travel.
+    The remaining 10 degrees cannot be commanded by software, so the scan includes
+    both end positions and alternates direction on the next ring to get the best
+    possible overlap from the other side.
+    """
+    safe_lim = abs(float(safe_lim))
+    lo, hi = -safe_lim, safe_lim
+    count = int(count)
+    if count <= 0:
+        return []
+    if count == 1:
+        arr = [0.0]
+    else:
+        arr = [lo + i*(hi-lo)/(count-1) for i in range(count)]
+    if reverse:
+        arr.reverse()
+    return arr
+
 
 def compute_mid_pose(cfg, height_cm):
     h0,h1 = float(cfg["height_low_cm"]), float(cfg["height_high_cm"])
@@ -698,9 +740,9 @@ class App:
         rg = self._group(self.tab_profiles, "Manual Rings (S = shoulder, E = elbow)")
         rg.columnconfigure((0,1,2,3,4,5), weight=1)
 
-        self.var_r1s=tk.DoubleVar(value=-84); self.var_r1e=tk.DoubleVar(value=92)
-        self.var_r2s=tk.DoubleVar(value=-74); self.var_r2e=tk.DoubleVar(value=82)
-        self.var_r3s=tk.DoubleVar(value=-64); self.var_r3e=tk.DoubleVar(value=72)
+        self.var_r1s=tk.DoubleVar(value=80); self.var_r1e=tk.DoubleVar(value=75)
+        self.var_r2s=tk.DoubleVar(value=75); self.var_r2e=tk.DoubleVar(value=75)
+        self.var_r3s=tk.DoubleVar(value=70); self.var_r3e=tk.DoubleVar(value=70)
 
         for col, (title, vs, ve) in enumerate([
             ("Ring 1", self.var_r1s, self.var_r1e),
@@ -765,6 +807,8 @@ class App:
         self._row(g, 1, "Delay (s):",  self.var_delay,        0)
         self._row(g, 2, "Base center (°):", self.var_base_center, 0)
         self._row(g, 2, "Half span (°):",   self.var_base_half,   2)
+        ttk.Label(g, text="360 mode uses -Safety limit to +Safety limit; center/half are kept only for compatibility.",
+                  font=("Segoe UI",9), foreground=THEMES["dark"]["text2"]).grid(row=4, column=0, columnspan=4, sticky="w", pady=(2,4))
         self._row(g, 3, "Safety limit (°):",self.var_safe_lim,    0)
         self._row(g, 3, "Hand lock (°):",   self.var_hand_lock,   2)
         ttk.Checkbutton(g, text="Hold last pose (torque ON)",
@@ -792,7 +836,7 @@ class App:
 
         for row_i, (lbl, var, lo, hi) in enumerate([
             ("Base",     self.var_m_base, -175, 175),
-            ("Shoulder", self.var_m_s,    -120, -30),
+            ("Shoulder", self.var_m_s,    -120, 120),
             ("Elbow",    self.var_m_e,      20, 110),
             ("Hand",     self.var_m_h,       0, 120)]):
 
@@ -965,7 +1009,7 @@ class App:
         self.cfg.setdefault("profiles",[]).append({
             "name":nm,"height_cm":20.0,"width_cm":30.0,"clearance_cm":5.0,
             "use_manual_rings":True,
-            "manual_rings":[{"s":-84.0,"e":92.0},{"s":-74.0,"e":82.0},{"s":-64.0,"e":72.0}]})
+            "manual_rings":[{"s":80.0,"e":75.0},{"s":75.0,"e":75.0},{"s":70.0,"e":70.0}]})
         self.refresh_profiles_dropdown()
         self.var_profile.set(nm)
         self.load_selected_profile_to_editor()
@@ -995,9 +1039,9 @@ class App:
         self.var_p_manual.set(bool(p.get("use_manual_rings",True)))
         mr = p.get("manual_rings",[])
         if len(mr)>=3:
-            self.var_r1s.set(float(mr[0].get("s",-84))); self.var_r1e.set(float(mr[0].get("e",92)))
-            self.var_r2s.set(float(mr[1].get("s",-74))); self.var_r2e.set(float(mr[1].get("e",82)))
-            self.var_r3s.set(float(mr[2].get("s",-64))); self.var_r3e.set(float(mr[2].get("e",72)))
+            self.var_r1s.set(float(mr[0].get("s",80))); self.var_r1e.set(float(mr[0].get("e",75)))
+            self.var_r2s.set(float(mr[1].get("s",75))); self.var_r2e.set(float(mr[1].get("e",75)))
+            self.var_r3s.set(float(mr[2].get("s",70))); self.var_r3e.set(float(mr[2].get("e",70)))
 
     def save_editor_to_selected_profile(self):
         self._sync_cfg_from_ui()
@@ -1118,8 +1162,8 @@ class App:
         self.var_acc.set(int(self.cfg.get("acc",20)))
         self.var_delay.set(float(self.cfg.get("delay_s",0.3)))
         self.var_hold.set(bool(self.cfg.get("hold_last_pose",True)))
-        self.var_base_center.set(float(self.cfg.get("base_center_deg",90)))
-        self.var_base_half.set(float(self.cfg.get("base_half_span_deg",155)))
+        self.var_base_center.set(float(self.cfg.get("base_center_deg",0)))
+        self.var_base_half.set(float(self.cfg.get("base_half_span_deg",175)))
         self.var_safe_lim.set(float(self.cfg.get("safe_limit_deg",175)))
         self.var_hand_lock.set(float(self.cfg.get("lock_hand_deg",62)))
         self.var_h_low.set(float(self.cfg.get("height_low_cm",10)))
@@ -1306,6 +1350,11 @@ class App:
                     ok_mk, msg_mk = pi_mkdir(self.cfg, base_storage)
                     if not ok_mk: raise RuntimeError(f"Cannot create storage: {msg_mk}")
 
+                # Verification is shown directly in the Live Log only.
+                # No CSV file is created. After every ring, the app reports:
+                # planned base coverage, actual feedback coverage, missing degrees,
+                # average base error, and failed captures.
+
                 rings,_,_,_,_,_,auto = compute_rings_from_profile(self.cfg, prof)
                 self.log("Rings [{}]: {}".format("AUTO" if auto else "MANUAL",
                     " | ".join(f"S={s:.1f} E={e:.1f}" for s,e in rings)))
@@ -1314,29 +1363,55 @@ class App:
                 for i in range(total%3): per[i]+=1
                 self.log(f"Total={total} | per ring={per}")
 
-                center   = float(self.cfg["base_center_deg"])
-                half     = float(self.cfg["base_half_span_deg"])
-                safe_lim = float(self.cfg["safe_limit_deg"])
+                safe_lim = abs(float(self.cfg["safe_limit_deg"]))
                 done     = 0
+
+                # Full 360-style base planning:
+                # The old code used center=90 and half=155, which was clipped to -65..175
+                # and gave only 240 degrees. Here we always use the widest safe sweep:
+                # -safe_limit .. +safe_limit. With +/-175 this is 350 degrees.
+                base_lo, base_hi = -safe_lim, safe_lim
+                base_coverage = base_hi - base_lo
+                mechanical_gap = max(0.0, 360.0 - base_coverage)
+                first_reverse = choose_360_start_reverse(start_b, safe_lim)
+                self.log(f"Base sweep: {base_lo:.1f}° to {base_hi:.1f}° | coverage={base_coverage:.1f}°")
+                if mechanical_gap <= 12.0:
+                    self.log(f"Base gap accepted: {mechanical_gap:.1f}° missing is OK for this robot limit. Reverse sweep + edge shots will be used.")
+                else:
+                    self.log(f"[WARN] Mechanical base gap={mechanical_gap:.1f}°. Software cannot command this gap; using edge shots + reverse sweep from the other side.")
 
                 for ring_i, ((s_deg,e_deg), ring_count) in enumerate(zip(rings,per), start=1):
                     if self.abort_event.is_set(): break
-                    self.log(f"Ring {ring_i}/3: S={s_deg:.1f} E={e_deg:.1f} ({ring_count} shots)")
+                    ring_reverse = first_reverse if (ring_i % 2 == 1) else (not first_reverse)
+                    direction_txt = "+→-" if ring_reverse else "-→+"
+                    self.log(f"Ring {ring_i}/3: S={s_deg:.1f} E={e_deg:.1f} ({ring_count} shots) | base {direction_txt}")
                     move_joints_deg(self.cfg, shoulder=s_deg, elbow=e_deg,
                                     hand=self.cfg["lock_hand_deg"],
                                     spd=self.cfg["spd"], acc=self.cfg["acc"], log=None)
-                    plan = plan_angles_centered(center, half, ring_count, safe_lim,
-                                               start_b if ring_i==1 else None)
-                    for b_deg in plan:
+                    plan = plan_base_360_sweep(ring_count, safe_lim, reverse=ring_reverse)
+
+                    ring_actual = []
+                    ring_planned = []
+                    ring_failed = 0
+
+                    for ring_shot, b_deg in enumerate(plan, start=1):
                         if self.abort_event.is_set(): break
                         safe_b = clip_base_deg(b_deg, safe_lim)
                         done  += 1
-                        move_joints_deg(self.cfg, base=safe_b, shoulder=s_deg, elbow=e_deg,
-                                        hand=self.cfg["lock_hand_deg"],
-                                        spd=self.cfg["spd"], acc=self.cfg["acc"], log=None)
+                        fb_move = move_joints_deg(self.cfg, base=safe_b, shoulder=s_deg, elbow=e_deg,
+                                                  hand=self.cfg["lock_hand_deg"],
+                                                  spd=self.cfg["spd"], acc=self.cfg["acc"], log=None)
+                        actual_b = math.degrees(fb_move.get("b", 0))
+                        err_b = actual_b - safe_b
+                        ring_actual.append(actual_b)
+                        ring_planned.append(safe_b)
+
                         tag = f"{test_name}_R{ring_i}_{str(done).zfill(3)}_b{int(round(safe_b))}_S{int(round(s_deg))}"
+                        capture_ok = True
                         if self.cfg["use_cameras"]:
-                            if not trigger_capture_store_rotate(self.cfg, tag, base_storage, log=self.log):
+                            capture_ok = trigger_capture_store_rotate(self.cfg, tag, base_storage, log=self.log)
+                            if not capture_ok:
+                                ring_failed += 1
                                 self.log(f"CAPTURE FAIL at {done}/{total} (tag={tag})")
 
                         eta_s    = int((time.time()-t0)/max(1,done)*(total-done))
@@ -1348,9 +1423,35 @@ class App:
                             self.log(f"Progress {done}/{total} | ETA {timedelta(seconds=eta_s)} | End {pred_end.strftime('%H:%M:%S')}")
                         time.sleep(float(self.cfg["delay_s"]))
 
+                    if ring_actual:
+                        planned_cov = max(ring_planned) - min(ring_planned)
+                        actual_cov  = max(ring_actual)  - min(ring_actual)
+                        planned_missing = max(0.0, 360.0 - planned_cov)
+                        actual_missing  = max(0.0, 360.0 - actual_cov)
+                        avg_abs_err = sum(abs(a-p) for a,p in zip(ring_actual, ring_planned)) / len(ring_actual)
+
+                        if actual_missing <= 12.0 and ring_failed == 0:
+                            status = "OK ✅"
+                        elif actual_missing <= 12.0 and ring_failed > 0:
+                            status = "ANGLE OK, but capture failed ⚠️"
+                        else:
+                            status = "LOW COVERAGE ⚠️"
+
+                        self.log(
+                            f"Ring {ring_i} 360 check: {status} | "
+                            f"planned {min(ring_planned):.1f}°..{max(ring_planned):.1f}° "
+                            f"= {planned_cov:.1f}° coverage, missing {planned_missing:.1f}° | "
+                            f"actual {min(ring_actual):.1f}°..{max(ring_actual):.1f}° "
+                            f"= {actual_cov:.1f}° coverage, missing {actual_missing:.1f}° | "
+                            f"avg base error={avg_abs_err:.2f}°, failed captures={ring_failed}"
+                        )
+                        if actual_missing > 12.0:
+                            self.log(f"[WARN] Ring {ring_i}: more than ~10° is missing. Check base limit, cable obstruction, speed/acceleration, or servo feedback.")
+
                 self.log(f"Elapsed: {timedelta(seconds=int(time.time()-t0))}")
                 if not self.cfg["hold_last_pose"]: torque(self.cfg, on=False, log=self.log)
                 self.log("DONE ✅")
+                self.log("360 verification was printed in the Live Log only; no CSV file was created.")
                 self.log(f"Browse images → http://{self.cfg.get('pi_host','192.168.4.20')}:{self.cfg.get('pi_port',8765)}/browse")
 
             except Exception as e:
