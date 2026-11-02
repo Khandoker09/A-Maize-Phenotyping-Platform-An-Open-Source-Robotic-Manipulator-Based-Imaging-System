@@ -4,7 +4,7 @@ Universal Phenotyping Acquisition Platform
 
 ## System flow
 
-![UPAP system flow](umapp_system_flowchart.svg)
+![UPAP system flow](fig2.jpg)
 
 # Plant Point Cloud Stem–Leaf Segmentation Using SimplePointNetSeg
 
