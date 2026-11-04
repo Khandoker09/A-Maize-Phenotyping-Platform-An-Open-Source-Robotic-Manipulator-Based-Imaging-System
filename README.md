@@ -2,7 +2,7 @@
 
 Universal Phenotyping Acquisition Platform
 
-## System flow
+## System flow 
 
 ![UPAP system flow](fig2.jpg)
 
@@ -23,5 +23,4 @@ The `SimplePointNetSeg` model performs point-wise semantic segmentation by learn
 5. Predict stem and leaf points on new plant point clouds.
 6. Split predicted leaf points into individual leaves using clustering.
 7. Estimate plant height, leaf length, and leaf angle from the segmented point cloud.
-
 This repository is intended as a practical starting point for 3D plant phenotyping using low-complexity deep learning and geometry-based post-processing.
